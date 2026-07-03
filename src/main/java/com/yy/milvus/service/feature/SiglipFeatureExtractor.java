@@ -4,8 +4,8 @@ import ai.onnxruntime.*;
 import com.yy.milvus.config.EmbeddingProperties;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
-import lombok.extern.slf4j.Slf4j;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
@@ -20,16 +20,17 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.List;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 基于 ONNX Runtime 的 SigLIP 2 图像特征提取器。
- *
+ * <p>
  * 与 CLIP 的差异：
  * - SigLIP 2 使用 sigmoid 对比损失（而非 CLIP 的 InfoNCE），训练更稳定
  * - 在零样本分类、图文检索任务上比 CLIP 精度高 1-3%
  * - 同样是视觉-语言对齐模型，适合语义理解 + 视觉特征混合场景
- *
+ * <p>
  * 预处理与 CLIP 相同：CLIP mean/std 归一化。
  */
 @Component("siglipExtractor")
@@ -48,14 +49,15 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
     // 与 CLIP 不同: CLIP 用 OpenAI AI-1 渲染图集算的 mean=[0.48145466, 0.4578275, 0.40821073]
     // ============================================================
     private static final float[] MEAN = {0.5f, 0.5f, 0.5f};
-    private static final float[] STD  = {0.5f, 0.5f, 0.5f};
+    private static final float[] STD = {0.5f, 0.5f, 0.5f};
 
     // 预计算倒数 + mean 归一化等价于 (x/255 - MEAN) / STD，但 (x*INV255 - MEAN)/STD = (x*INV255 - MEAN)*INV_STD
     // = x*INV255*INV_STD - MEAN*INV_STD。
     // 这样 preprocessing 主循环里只需要：f = x * KV[c] - BM[c]
-    private static final float[] INV_255 = { 1f / 255f, 1f / 255f, 1f / 255f };
+    private static final float[] INV_255 = {1f / 255f, 1f / 255f, 1f / 255f};
     private static final float[] KV = new float[3]; // x*KV
     private static final float[] BM = new float[3]; // x*KV - BM
+
     static {
         for (int i = 0; i < 3; i++) {
             KV[i] = INV_255[i] / STD[i];
@@ -82,6 +84,7 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         int peak = PEAK_BORROWED.get();
         if (cur > peak) PEAK_BORROWED.set(cur);
     }
+
     private static void noteReturn() {
         CURRENT_BORROWED.decrementAndGet();
     }
@@ -89,7 +92,9 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
     private OrtEnvironment env;
     private Path modelPath;
     private int[] scales;
-    /** 模型输入图片尺寸，从 embedding.siglip.input-size 配置读取 */
+    /**
+     * 模型输入图片尺寸，从 embedding.siglip.input-size 配置读取
+     */
     private int inputSize;
 
     @PostConstruct
@@ -116,10 +121,10 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         modelPath = resolveModelPath(siglip.getVisionModelPath(), "SigLIP");
         ensureModelFile(modelPath, "SigLIP");
 
-        int poolSize = resolvePoolSize(siglip.getSessionPoolSize());
+        int poolSize = resolvePoolSize(siglip.getSessionPoolSize(), this.scales.length);
         log.info("[SigLIP 启动] 开始创建 {} 个 session ...", poolSize);
 
-        OrtSession.SessionOptions opts = buildOpts();
+        OrtSession.SessionOptions opts = buildOpts(poolSize);
         for (int i = 0; i < poolSize; i++) {
             OrtSession s = env.createSession(modelPath.toString(), opts);
             POOL.addLast(s);
@@ -135,13 +140,14 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         log.info("[SigLIP 启动] ✅ 初始化完成，pool 最终 size={}", POOL.size());
     }
 
-    private static int resolvePoolSize(int configured) {
+    private static int resolvePoolSize(int configured, int scaleCount) {
         if (configured > 0) return configured;
-        return Math.min(Math.max(1, Runtime.getRuntime().availableProcessors()), 8);
+        int cores = Math.max(1, Runtime.getRuntime().availableProcessors());
+        return Math.min(cores, scaleCount);
     }
 
     private static int[] parseScales(List<Integer> list) {
-        if (list == null || list.isEmpty()) return new int[] { DEFAULT_IMG_SIZE };
+        if (list == null || list.isEmpty()) return new int[]{DEFAULT_IMG_SIZE};
         int[] result = new int[list.size()];
         for (int i = 0; i < list.size(); i++) {
             int v = list.get(i);
@@ -184,45 +190,53 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                 cnt, String.format("%.1f", avgPre), String.format("%.1f", avgInfer),
                 CURRENT_BORROWED.get(), PEAK_BORROWED.get());
     }
+
     private static final java.util.concurrent.atomic.AtomicLong LAST_STATS_LOG_MS_HOLDER = new java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis());
+
     private static boolean LAST_STATS_LOG_MS_CAS(long expected, long update) {
         return LAST_STATS_LOG_MS_HOLDER.compareAndSet(expected, update);
     }
 
-    private OrtSession.SessionOptions buildOpts() {
+    private OrtSession.SessionOptions buildOpts(int sessionPoolSize) {
         OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
+        EmbeddingProperties.SiglipProperties siglip = embeddingProps.getSiglip();
+        int intraOp;
+        int cpuCores = Runtime.getRuntime().availableProcessors();
+        if (embeddingProps.isBatchMode()) {
+            // 批量入库模式：IntraOp=1，让 session 走单线程、不抢 CPU；
+            // N 张图并发时整体 CPU 占用可控，每个 session 排队等待本身不会变慢。
+            intraOp = 1;
+            log.info("[DINO 启动] batch-mode=true → IntraOp=1（批量友好，避免抢 CPU）");
+        } else {
+            // 单图搜图模式：让 session 内部多线程榨干 CPU。
+            // 关键：不能超过"session 池同时全借出时的总线程数 ≤ CPU 物理核数"。
+            // 否则上下文切换和锁竞争反而拖慢每张图。
+            int idealIntra = Math.max(1, cpuCores / Math.max(1, sessionPoolSize));
+            // 还要兼容"pool < CPU" 的情况（少数高性能场景，每个 session 多核）
+            // 可以使用多个线程，因为只是查询一张图
+            intraOp = Math.max(siglip.getScales().size() * 2, idealIntra);
+            log.info("[Siglip 启动] batch-mode=false → IntraOp={}（cpuCores={}，pool={}，",
+                    intraOp, cpuCores, sessionPoolSize);
+        }
         try {
             opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
+            opts.setIntraOpNumThreads(intraOp);
+            opts.setInterOpNumThreads(intraOp);
+            opts.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL);
 
-            int cores = Runtime.getRuntime().availableProcessors();
-            // 1) 推荐配置：pool 16 × intra 1 = 16 线程；这是 ONNX CPU 最稳的高并发策略。
-            //    如果 cores 远大于此，可放大到 8 个一组 session × intra 8 = 64 线程 ——
-            //    但 session × intra 超过 cores 时反而会因上下文切换降速。
-            int poolSizeConfigured = embeddingProps.getSiglip().getSessionPoolSize();
-            if (poolSizeConfigured <= 0) poolSizeConfigured = Math.clamp(cores, 1, 8);
-            int intra = Math.clamp(cores / poolSizeConfigured, 1, 8);
-            if (intra < 1) intra = 1;
-
-            opts.setIntraOpNumThreads(intra);
-            try {
-                opts.setInterOpNumThreads(1);
-                opts.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL);
-                try { opts.setMemoryPatternOptimization(true); } catch (NoSuchMethodError ignore) {}
-            } catch (Exception ignore) {}
-
-            log.info("[SigLIP 配置] intraOpNumThreads={} | poolSize={} | cores={} (按 poolSizeConfigured={})",
-                    intra, poolSizeConfigured, cores, poolSizeConfigured);
-        } catch (OrtException e) { throw new RuntimeException(e); }
+        } catch (OrtException e) {
+            throw new RuntimeException(e);
+        }
         return opts;
     }
 
     private void ensureModelFile(Path p, String tower) throws IOException {
         if (!Files.exists(p)) {
             throw new IOException(
-                "\n[SigLIP] " + tower + "模型文件找不到: " + p.toAbsolutePath() + "\n" +
-                "[SigLIP] 请检查 application.yml 中 embedding.siglip.vision-model-path 是否正确\n" +
-                "[SigLIP] 推荐下载 ONNX 模型:\n" +
-                "[SigLIP]   https://huggingface.co/onnx-community/siglip2-base-patch16-256-ONNX"
+                    "\n[SigLIP] " + tower + "模型文件找不到: " + p.toAbsolutePath() + "\n" +
+                            "[SigLIP] 请检查 application.yml 中 embedding.siglip.vision-model-path 是否正确\n" +
+                            "[SigLIP] 推荐下载 ONNX 模型:\n" +
+                            "[SigLIP]   https://huggingface.co/onnx-community/siglip2-base-patch16-256-ONNX"
             );
         }
     }
@@ -244,7 +258,8 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                 log.info("[SigLIP] {}模型使用 classpath: {}", tower, cp);
                 return cp;
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
         if (Files.exists(p)) {
             log.warn("[SigLIP] {}模型使用工作目录相对路径: {}", tower, p.toAbsolutePath());
             return p.toAbsolutePath();
@@ -258,32 +273,68 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         OrtSession s;
         int count = 0;
         while ((s = POOL.pollFirst()) != null) {
-            try { s.close(); count++; } catch (Exception ignored) {}
+            try {
+                s.close();
+                count++;
+            } catch (Exception ignored) {
+            }
         }
         log.info("[SigLIP 关闭] 已销毁 {} 个 session", count);
         if (env != null) env.close();
     }
 
-    @Override public float[] extractFeature(File imageFile) throws IOException {
+    @Override
+    public float[] extractFeature(File imageFile) throws IOException {
+        return extractFeature(imageFile, null);
+    }
+
+    @Override
+    public float[] extractFeature(InputStream inputStream) throws IOException {
+        return extractFeature(inputStream, null);
+    }
+
+    @Override
+    public float[] extractFeature(byte[] imageBytes) throws IOException {
+        return extractFeature(imageBytes, null);
+    }
+
+    /**
+     * 单图特征提取（可选：传入 ExecutorService 触发单图内多尺度并发）。
+     *
+     * <p>传入 executor 后，SigLIP 的多个尺度 [224,256,384] 会并发提交到线程池，借不同 session
+     * 真正并行推理。3 个尺度的总耗时 ≈ max(t_224, t_256, t_384) 而不是 sum。
+     * session 池容量需 ≥ scales.length（默认 16 个 session，3 个尺度完全够用）。
+     *
+     * <p>executor == null 时退化为串行多尺度（保持与原行为一致）。
+     */
+    @Override
+    public float[] extractFeature(File imageFile, ExecutorService exec) throws IOException {
         if (imageFile == null || !imageFile.exists() || imageFile.length() == 0) {
             throw new IOException("图像文件不可读: " + (imageFile == null ? "<null>" : imageFile.getAbsolutePath()));
         }
         BufferedImage img = ImageIO.read(imageFile);
         if (img == null) throw new IOException("无法解码图像: " + imageFile.getAbsolutePath());
-        return extractFeatureFromBufferedImage(img);
+        return extractFeatureFromBufferedImage(img, exec);
     }
 
-    @Override public float[] extractFeature(InputStream inputStream) throws IOException {
+    @Override
+    public float[] extractFeature(InputStream inputStream, ExecutorService exec) throws IOException {
         BufferedImage img = ImageIO.read(inputStream);
         if (img == null) throw new IOException("无法解码图像 (InputStream)");
-        return extractFeatureFromBufferedImage(img);
+        return extractFeatureFromBufferedImage(img, exec);
     }
 
-    @Override public float[] extractFeature(byte[] imageBytes) throws IOException {
-        return extractFeatureFromBufferedImage(ImageIO.read(new java.io.ByteArrayInputStream(imageBytes)));
+    @Override
+    public float[] extractFeature(byte[] imageBytes, ExecutorService exec) throws IOException {
+        return extractFeatureFromBufferedImage(
+                ImageIO.read(new java.io.ByteArrayInputStream(imageBytes)), exec);
     }
 
-    private float[] extractFeatureFromBufferedImage(BufferedImage image) throws IOException {
+    /**
+     * @param scaleExecutor 可选：传入非空时启用"单图内多尺度并发"，N 个尺度借不同 session 并行推理。
+     *                      session 池容量必须 ≥ scales.length，否则会因借不到 session 而退化为串行（仍能跑通）。
+     */
+    private float[] extractFeatureFromBufferedImage(BufferedImage image, ExecutorService scaleExecutor) throws IOException {
         if (image == null) throw new IOException("图片读取失败");
         BufferedImage rgb = toRgb(image);
         // 服装设计图场景适配：先去掉白边再推理（仅当白边显著时才生效）
@@ -294,14 +345,14 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         float[] embFlipped = null;
 
         try {
-            embOriginal = runMultiScale(rgb);
+            embOriginal = runMultiScale(rgb, scaleExecutor);
             avgLen = embOriginal.length;
 
             if (embeddingProps.getSiglip().isHflipEnabled()) {
                 // 翻转版本复用 runMultiScale 路径（这里仅仅是把图翻了再喂），保持效果等价。
                 // 真实热点在 ONNX 推理本身，详见 preprocess / session 选项优化。
                 BufferedImage flippedRgb = flipHorizontal(rgb);
-                embFlipped = runMultiScale(flippedRgb);
+                embFlipped = runMultiScale(flippedRgb, scaleExecutor);
                 if (embFlipped.length == avgLen) {
                     for (int i = 0; i < avgLen; i++) embOriginal[i] = (embOriginal[i] + embFlipped[i]) * 0.5f;
                 }
@@ -312,7 +363,34 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         }
     }
 
-    private float[] runMultiScale(BufferedImage rgb) throws IOException {
+    /**
+     * 对给定图片跑多尺度推理，返回 L2 归一化前的平均 embedding。
+     *
+     * <p>并发策略（按调用方意图区分）：
+     * <ul>
+     *   <li>{@code scaleExecutor == null}：调用方是同步直接调用（典型场景：单图搜图）。
+     *       走 {@link ForkJoinPool#commonPool()} 多尺度并发。</li>
+     *   <li>{@code scaleExecutor != null}：调用方正在批量池里跑（典型场景：批量入库）。
+     *       <b>强制走串行多尺度</b>。原因：外层池已塞满，并发只会争资源、拖慢整体 throughput。</li>
+     * </ul>
+     *
+     * @param scaleExecutor 非 null 表示"我在批量池里跑，请串行"；null 表示"我是孤立的单图调用，请并发加速"
+     */
+    private float[] runMultiScale(BufferedImage rgb, ExecutorService scaleExecutor) throws IOException {
+        if (scales.length <= 1) {
+            return runMultiScaleSerial(rgb);
+        }
+        if (scaleExecutor != null) {
+            return runMultiScaleSerial(rgb);
+        }
+        ForkJoinPool pool = ForkJoinPool.commonPool();
+        if (pool.getParallelism() < 2) {
+            return runMultiScaleSerial(rgb);
+        }
+        return runMultiScaleParallel(rgb);
+    }
+
+    private float[] runMultiScaleSerial(BufferedImage rgb) throws IOException {
         int avgLen = -1;
         float[] avg = null;
         int validScales = 0;
@@ -322,8 +400,13 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
             int w = rgb.getWidth();
             int h = rgb.getHeight();
             int newW, newH;
-            if (w < h) { newW = targetShort; newH = (int) Math.round((float) h * targetShort / w); }
-            else        { newH = targetShort; newW = (int) Math.round((float) w * targetShort / h); }
+            if (w < h) {
+                newW = targetShort;
+                newH = (int) Math.round((float) h * targetShort / w);
+            } else {
+                newH = targetShort;
+                newW = (int) Math.round((float) w * targetShort / h);
+            }
 
             BufferedImage resized = resizeDirect(rgb, newW, newH);
 
@@ -333,7 +416,7 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                 Graphics2D g = tensorInput.createGraphics();
                 g.setColor(Color.BLACK);
                 g.fillRect(0, 0, inputSize, inputSize);
-                int offX = (inputSize - resized.getWidth())  / 2;
+                int offX = (inputSize - resized.getWidth()) / 2;
                 int offY = (inputSize - resized.getHeight()) / 2;
                 g.drawImage(resized, offX, offY, null);
                 g.dispose();
@@ -366,6 +449,109 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         return avg;
     }
 
+    /**
+     * 多尺度并发：调用线程串行完成所有尺度的 resize/crop（输出 N 张 inputSize×inputSize BufferedImage），
+     * 然后 invokeAll 提交到 {@link ForkJoinPool#commonPool()} 跑 N 个 inference 任务。
+     *
+     * <p>此方法仅在调用方传 {@code null} 时进入（即单图搜图场景，请求方不在任何池里跑），
+     * 用 JVM 全局 commonPool 即可，无需借用调用方的池。
+     */
+    private float[] runMultiScaleParallel(BufferedImage rgb) throws IOException {
+        int n = scales.length;
+
+        // 1) 在调用线程里完成所有尺度的 resize/crop —— BufferedImage 共享给子任务只读使用
+        BufferedImage[] tensorInputs = new BufferedImage[n];
+        int[] targetShorts = new int[n];
+        for (int si = 0; si < n; si++) {
+            int targetShort = scales[si];
+            targetShorts[si] = targetShort;
+            int w = rgb.getWidth();
+            int h = rgb.getHeight();
+            int newW, newH;
+            if (w < h) {
+                newW = targetShort;
+                newH = (int) Math.round((float) h * targetShort / w);
+            } else {
+                newH = targetShort;
+                newW = (int) Math.round((float) w * targetShort / h);
+            }
+
+            BufferedImage resized = resizeDirect(rgb, newW, newH);
+
+            BufferedImage tensorInput;
+            if (resized.getWidth() < inputSize || resized.getHeight() < inputSize) {
+                tensorInput = new BufferedImage(inputSize, inputSize, BufferedImage.TYPE_INT_RGB);
+                Graphics2D g = tensorInput.createGraphics();
+                try {
+                    g.setColor(Color.BLACK);
+                    g.fillRect(0, 0, inputSize, inputSize);
+                    int offX = (inputSize - resized.getWidth()) / 2;
+                    int offY = (inputSize - resized.getHeight()) / 2;
+                    g.drawImage(resized, offX, offY, null);
+                } finally {
+                    g.dispose();
+                }
+            } else {
+                tensorInput = centerCrop(resized, inputSize, inputSize);
+            }
+            tensorInputs[si] = tensorInput;
+        }
+
+        // 2) 提交到 ForkJoinPool.commonPool：每个任务自己借一个 session，跑一个尺度
+        //    关键：使用 commonPool 而非调用方传入的池，避免与 featureExecutor 互锁导致死锁。
+        List<Callable<float[]>> tasks = new ArrayList<>(n);
+        for (int si = 0; si < n; si++) {
+            final int idx = si;
+            tasks.add(() -> runInference(tensorInputs[idx]));
+        }
+
+        int avgLen = -1;
+        float[] avg = null;
+        int validScales = 0;
+        long t0 = System.currentTimeMillis();
+        try {
+            // 单图搜图场景下的多尺度并发加速：N 个尺度的 ONNX 推理并行执行，单图耗时 ≈ max 而不是 sum。
+            // 走 commonPool 而非调用方传入的池——因为这个分支只有调用方传 null 时才会进入（即"我不在任何池里跑"），
+            // 没有外层池可以借用，只能用 JVM 全局的 commonPool。
+            List<Future<float[]>> futures = ForkJoinPool.commonPool().invokeAll(tasks);
+            for (int si = 0; si < futures.size(); si++) {
+                float[] emb;
+                try {
+                    emb = futures.get(si).get();
+                } catch (ExecutionException e) {
+                    log.warn("[SigLIP 多尺度并发] 尺度 {} 推理失败: {}", targetShorts[si],
+                            e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
+                    continue;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("SigLIP 多尺度并发被中断", e);
+                }
+                if (avg == null) {
+                    avgLen = emb.length;
+                    avg = new float[avgLen];
+                } else if (emb.length != avgLen) {
+                    log.warn("[SigLIP 多尺度并发] 尺度 {} 维度 {} 与首尺度 {} 不一致，跳过",
+                            targetShorts[si], emb.length, avgLen);
+                    continue;
+                }
+                validScales++;
+                float scale = 1.0f / n;
+                for (int i = 0; i < avgLen; i++) avg[i] += emb[i] * scale;
+            }
+            log.debug("[SigLIP 多尺度并发] scales={} | 总等待 {}ms | 有效 {}/{}",
+                    Arrays.toString(scales), System.currentTimeMillis() - t0, validScales, n);
+        } catch (Exception e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("SigLIP 多尺度并发被中断", e);
+        }
+
+        if (avg == null || validScales == 0) {
+            log.warn("[SigLIP 多尺度并发] 所有尺度都不可用，降级到单尺度串行");
+            return runSingleScaleFallback(rgb);
+        }
+        return avg;
+    }
+
     private float[] runInference(BufferedImage tensorInput) throws OrtException {
         long tPre = System.nanoTime();
         float[][][][] chw = preprocess(tensorInput);
@@ -385,7 +571,10 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                 maybeLogStats();
                 return out;
             } finally {
-                try { result.close(); } catch (Exception ignore) {}
+                try {
+                    result.close();
+                } catch (Exception ignore) {
+                }
                 map.clear(); // 去掉对 OnnxTensor 的引用，避免在 OnnxTensor close 前还有别的引用
             }
         } finally {
@@ -401,8 +590,13 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
             BufferedImage rgb = toRgb(image);
             int w = rgb.getWidth(), h = rgb.getHeight();
             int newW, newH;
-            if (w < h) { newW = inputSize; newH = (int) Math.round((float) h * inputSize / w); }
-            else        { newH = inputSize; newW = (int) Math.round((float) w * inputSize / h); }
+            if (w < h) {
+                newW = inputSize;
+                newH = (int) Math.round((float) h * inputSize / w);
+            } else {
+                newH = inputSize;
+                newW = (int) Math.round((float) w * inputSize / h);
+            }
             BufferedImage resized = resizeDirect(rgb, newW, newH);
             BufferedImage cropped = centerCrop(resized, inputSize, inputSize);
             float[][][][] chw = preprocess(cropped);
@@ -415,8 +609,11 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                 } finally {
                     map.clear();
                 }
-            } catch (OrtException e) { throw new IOException("SigLIP 推理失败: " + e.getMessage(), e); }
-            finally { returnSession(session); }
+            } catch (OrtException e) {
+                throw new IOException("SigLIP 推理失败: " + e.getMessage(), e);
+            } finally {
+                returnSession(session);
+            }
         } catch (Exception e) {
             throw new IOException("SigLIP 单尺度降级失败: " + e.getMessage(), e);
         }
@@ -444,8 +641,8 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                 int px = pixels[idx++];
                 // getRGB 返回 0xAARRGGBB 形式
                 rRow[x] = ((px >> 16) & 0xFF) * kvR - bmR;
-                gRow[x] = ((px >> 8)  & 0xFF) * kvG - bmG;
-                bRow[x] = ( px        & 0xFF) * kvB - bmB;
+                gRow[x] = ((px >> 8) & 0xFF) * kvG - bmG;
+                bRow[x] = (px & 0xFF) * kvB - bmB;
             }
         }
         return data;
@@ -453,6 +650,7 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
 
     // 简单的 ThreadLocal int[] 复用（每线程最多缓存 1 个 buffer）
     private static final ThreadLocal<int[]> PIXEL_BUFFER_HOLDER = new ThreadLocal<>();
+
     private static int[] borrowedIntBuffer(int need) {
         int[] buf = PIXEL_BUFFER_HOLDER.get();
         if (buf == null || buf.length < need) {
@@ -461,6 +659,7 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         }
         return buf;
     }
+
     private static void returnBorrowedIntBuffer(int[] buf) {
         // 当前实现直接复用，无需归还
     }
@@ -489,7 +688,9 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
             g.setColor(Color.BLACK);
             g.fillRect(0, 0, targetW, targetH); // 黑边
             g.drawImage(src, 0, 0, targetW, targetH, x, y, x + cropW, y + cropH, null);
-        } finally { g.dispose(); }
+        } finally {
+            g.dispose();
+        }
         return out;
     }
 
@@ -497,21 +698,24 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         int w = src.getWidth(), h = src.getHeight();
         BufferedImage out = new BufferedImage(w, h, src.getType());
         Graphics2D g = out.createGraphics();
-        try { g.drawImage(src, w, 0, -w, h, null); }
-        finally { g.dispose(); }
+        try {
+            g.drawImage(src, w, 0, -w, h, null);
+        } finally {
+            g.dispose();
+        }
         return out;
     }
 
     /**
      * 自动裁掉白边（服装设计图场景适配）：扫描图片边界，找到非白内容 bbox 并裁切，
      * 然后外面 pad 黑边到原尺寸。padding 比例 <= 8% 时直接返回原图（避免小图误裁）。
-     *
+     * <p>
      * 算法：
-     *   - 把整图缩到 128×128（粗扫描，速度优先）
-     *   - 在缩略图上：像素亮度 > THRESHOLD(235) 视为"白/接近白"
-     *   - 找最外层非白行的 row range、col range
-     *   - 把这行映射回原图坐标作为 crop bbox
-     *   - 如果裁掉的边 < 4% 或裁出来的图本身 < 原图 70%，跳过（噪声保护）
+     * - 把整图缩到 128×128（粗扫描，速度优先）
+     * - 在缩略图上：像素亮度 > THRESHOLD(235) 视为"白/接近白"
+     * - 找最外层非白行的 row range、col range
+     * - 把这行映射回原图坐标作为 crop bbox
+     * - 如果裁掉的边 < 4% 或裁出来的图本身 < 原图 70%，跳过（噪声保护）
      */
     private static BufferedImage autoCropWhitespace(BufferedImage src) {
         int W = src.getWidth(), H = src.getHeight();
@@ -562,7 +766,9 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
             g.setColor(Color.WHITE);
             g.fillRect(0, 0, W, H);
             g.drawImage(src, 0, 0, W, H, x0, y0, x1, y1, null);
-        } finally { g.dispose(); }
+        } finally {
+            g.dispose();
+        }
         log.debug("[SigLIP 白底裁切] 原图 {}x{} -> 内容 bbox ({},{},{},{}), 裁掉面积 {:.1f}%",
                 W, H, x0, y0, x1, y1, removedArea * 100.0 / (W * H));
         return out;
@@ -575,7 +781,9 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
             g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
                     java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
             g.drawImage(src, 0, 0, w, h, null);
-        } finally { g.dispose(); }
+        } finally {
+            g.dispose();
+        }
         return out;
     }
 
@@ -613,9 +821,9 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
     /**
      * 从 ONNX 多个输出头中智能选取 image embedding。
      * 优先级：
-     *   1) 维度 == featureDim 的头（patch 数 256 一般=特征维）
-     *   2) shape 中含 image_embeds / pooler_output / embedding 关键字
-     *   3) 取第一个头（兜底）
+     * 1) 维度 == featureDim 的头（patch 数 256 一般=特征维）
+     * 2) shape 中含 image_embeds / pooler_output / embedding 关键字
+     * 3) 取第一个头（兜底）
      */
     private float[] pickEmbedOutput(OrtSession.Result result) throws OrtException {
         int target = embeddingProps.getSiglip().getFeatureDim();
@@ -632,7 +840,8 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                         return got;
                     }
                 }
-            } catch (Exception ignore) {}
+            } catch (Exception ignore) {
+            }
         }
         // 2. 按维度匹配：先看最后一维 == target
         for (java.util.Iterator<Map.Entry<String, OnnxValue>> it = result.iterator(); it.hasNext(); ) {
@@ -648,7 +857,8 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                         return got;
                     }
                 }
-            } catch (Exception ignore) {}
+            } catch (Exception ignore) {
+            }
         }
         // 3. 兜底：对第一个非空头做 mean pool 到 target 维（处理 [1,N,target] 这种 hidden state）
         for (java.util.Iterator<Map.Entry<String, OnnxValue>> it = result.iterator(); it.hasNext(); ) {
@@ -663,7 +873,8 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                             e.getKey(), pooled.length);
                     return pooled;
                 }
-            } catch (Exception ignore) {}
+            } catch (Exception ignore) {
+            }
         }
         // 4. 真·兜底
         log.warn("[SigLIP 推理] 未找到 dim={} 的输出头，取第一个头", target);
@@ -715,7 +926,8 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                         int dim = -1;
                         if (val instanceof float[] fa) dim = fa.length;
                         else if (val instanceof float[][] a) dim = a.length > 0 ? a[0].length : -1;
-                        else if (val instanceof float[][][] a3) dim = a3.length > 0 && a3[0].length > 0 ? a3[0][0].length : -1;
+                        else if (val instanceof float[][][] a3)
+                            dim = a3.length > 0 && a3[0].length > 0 ? a3[0][0].length : -1;
                         else if (val instanceof List<?> l && !l.isEmpty()) {
                             Object row = l.get(0);
                             if (row instanceof float[] fr) dim = fr.length;
@@ -730,10 +942,10 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                     log.info("[SigLIP 头探测] 配置 featureDim={} | 匹配输出头={} dim={}", configured, matchedName, matched);
                     if (matched < 0) {
                         throw new IllegalStateException(String.format(
-                            "[SigLIP] 没有输出头的维度等于配置的 feature-dim=%d。\n" +
-                            "[SigLIP] ONNX 模型通常会输出多个头：image_embeds (768) + last_hidden_state (1024) 等。\n" +
-                            "[SigLIP] 请检查 yml embedding.siglip.feature-dim 是否与实际 image embedding 维度一致",
-                            configured));
+                                "[SigLIP] 没有输出头的维度等于配置的 feature-dim=%d。\n" +
+                                        "[SigLIP] ONNX 模型通常会输出多个头：image_embeds (768) + last_hidden_state (1024) 等。\n" +
+                                        "[SigLIP] 请检查 yml embedding.siglip.feature-dim 是否与实际 image embedding 维度一致",
+                                configured));
                     }
                     log.info("[SigLIP 头探测] ✅ 维度校验通过（命中输出头 {} dim={}）", matchedName, matched);
                 }

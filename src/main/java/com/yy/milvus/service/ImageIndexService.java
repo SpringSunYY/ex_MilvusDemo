@@ -136,7 +136,10 @@ public class ImageIndexService {
             ensureExecutor().submit(() -> {
                 long tt0 = System.currentTimeMillis();
                 try {
-                    float[] v = fe.extractFeature(f);
+                    // 调用 extractFeature(File, ExecutorService) 把 featureExecutor 传进去，
+                    // extractor 内部看到 "非 null 池子" 就走串行多尺度，避免与外层池互锁 + 减少 invokeAll 框架开销。
+                    // 单图搜图场景直接调 extractFeature(File)（不传池）走 commonPool 并发加速。
+                    float[] v = fe.extractFeature(f, ensureExecutor());
                     vectors.set(idx, v);
                     if (idx % progressEvery == 0 || idx == total - 1) {
                         log.info("[批量索引] 提特征进度 {}/{} | 最近单张 {}ms",

@@ -4,8 +4,8 @@ import ai.onnxruntime.*;
 import com.yy.milvus.config.EmbeddingProperties;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
-import lombok.extern.slf4j.Slf4j;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
@@ -20,21 +20,23 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 基于 ONNX Runtime 的 CLIP 图像特征提取器
  * 模型：clip-vit-base-patch32（512 维向量）
- *
+ * <p>
  * 输入预处理（CLIP 标准）：
- *  1. resize 到 224x224
- *  2. 转 RGB float32 [0, 1]
- *  3. 用 CLIP mean/std 归一化
- *  4. NCHW → Nx3x224x224
- *
+ * 1. resize 到 224x224
+ * 2. 转 RGB float32 [0, 1]
+ * 3. 用 CLIP mean/std 归一化
+ * 4. NCHW → Nx3x224x224
+ * <p>
  * 资源路径：
- *  类路径下的 models/clip-vit-base-patch32/（resources/models/...）
- *  或环境变量 CLIP_MODEL_DIR 指定的外部目录
+ * 类路径下的 models/clip-vit-base-patch32/（resources/models/...）
+ * 或环境变量 CLIP_MODEL_DIR 指定的外部目录
  */
 @Component("clipExtractor")
 @Slf4j
@@ -50,20 +52,30 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     private static final float[] MEAN = {0.48145466f, 0.4578275f, 0.40821073f};
     private static final float[] STD = {0.26862954f, 0.26130258f, 0.27577711f};
 
-    /** 视觉塔 session 池（static = 单例池，防止多 Bean 实例互相覆盖）；线程安全靠 synchronized + wait/notify */
+    /**
+     * 视觉塔 session 池（static = 单例池，防止多 Bean 实例互相覆盖）；线程安全靠 synchronized + wait/notify
+     */
     private static final Deque<OrtSession> VISION_POOL = new ArrayDeque<>();
-    /** 记录当前 Bean 是否已完成初始化（防止被新实例覆盖后重复初始化） */
+    /**
+     * 记录当前 Bean 是否已完成初始化（防止被新实例覆盖后重复初始化）
+     */
     private static volatile boolean initialized = false;
-    /** 记录实例 ID，用于排查多实例问题 */
+    /**
+     * 记录实例 ID，用于排查多实例问题
+     */
     private static final AtomicInteger INSTANCE_COUNT = new AtomicInteger(0);
     private final int instanceId = INSTANCE_COUNT.incrementAndGet();
 
     private OrtEnvironment env;
-    /** 文本塔 session（一般是低频，1 个就够） */
+    /**
+     * 文本塔 session（一般是低频，1 个就够）
+     */
     private OrtSession textSession;
     private Path visionModelPath;
     private Path textModelPath;
-    /** 解析后的多尺度数组，如 [224, 256]，至少 1 个元素 */
+    /**
+     * 解析后的多尺度数组，如 [224, 256]，至少 1 个元素
+     */
     private int[] scales;
 
     @PostConstruct
@@ -104,9 +116,9 @@ public class ClipFeatureExtractor implements FeatureExtractor {
         if (clip.isUseVision()) {
             visionModelPath = resolveModelPath(clip.getVisionModelPath(), "视觉塔");
             ensureModelFile(visionModelPath, "视觉塔");
-            int poolSize = resolvePoolSize(clip.getSessionPoolSize());
+            int poolSize = resolvePoolSize(clip.getSessionPoolSize(), this.scales.length);
             log.info("[CLIP 启动] 开始创建 {} 个视觉 session ...", poolSize);
-            OrtSession.SessionOptions opts = buildOpts();
+            OrtSession.SessionOptions opts = buildOpts(poolSize);
             for (int i = 0; i < poolSize; i++) {
                 OrtSession s = env.createSession(visionModelPath.toString(), opts);
                 VISION_POOL.addLast(s);
@@ -123,11 +135,11 @@ public class ClipFeatureExtractor implements FeatureExtractor {
             log.info("[CLIP 启动] 探测后 pool size: {} -> {}", poolBeforeProbe, poolAfterProbe);
             log.info("[CLIP 启动] ✅ 初始化完成，pool 最终 size={}", VISION_POOL.size());
         }
-        // 文本塔：低频，1 个 session 足够
+        // 文本塔
         if (clip.isUseText()) {
             textModelPath = resolveModelPath(clip.getTextModelPath(), "文本塔");
             ensureModelFile(textModelPath, "文本塔");
-            OrtSession.SessionOptions opts = buildOpts();
+            OrtSession.SessionOptions opts = buildOpts(1);
             textSession = env.createSession(textModelPath.toString(), opts);
             log.info("[CLIP] 文本塔已加载: {} | 输入: {} | 输出: {}",
                     textModelPath, textSession.getInputNames(), textSession.getOutputNames());
@@ -137,10 +149,10 @@ public class ClipFeatureExtractor implements FeatureExtractor {
         log.info("[CLIP 启动] ✅ 初始化完成，pool 最终 size={}", VISION_POOL.size());
     }
 
-    private static int resolvePoolSize(int configured) {
+    private static int resolvePoolSize(int configured, int length) {
         if (configured > 0) return configured;
         int cores = Math.max(1, Runtime.getRuntime().availableProcessors());
-        return Math.min(cores, 8);
+        return Math.min(cores, length * 2);
     }
 
     /**
@@ -148,7 +160,7 @@ public class ClipFeatureExtractor implements FeatureExtractor {
      */
     private static int[] parseScales(List<Integer> list) {
         if (list == null || list.isEmpty()) {
-            return new int[] { 224 };
+            return new int[]{224};
         }
         int[] result = new int[list.size()];
         for (int i = 0; i < list.size(); i++) {
@@ -159,7 +171,9 @@ public class ClipFeatureExtractor implements FeatureExtractor {
         return result;
     }
 
-    /** 借一个视觉 session；池空时阻塞等待归还，永不返回 null。 */
+    /**
+     * 借一个视觉 session；池空时阻塞等待归还，永不返回 null。
+     */
     private OrtSession borrowVisionSession() throws OrtException {
         synchronized (VISION_POOL) {
             int waitCount = 0;
@@ -192,21 +206,32 @@ public class ClipFeatureExtractor implements FeatureExtractor {
         }
     }
 
-    private OrtSession.SessionOptions buildOpts() {
+    private OrtSession.SessionOptions buildOpts(int sessionPoolSize) {
         OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
+        EmbeddingProperties.ClipProperties clip = embeddingProps.getClip();
+        int intraOp;
+        int cpuCores = Runtime.getRuntime().availableProcessors();
+        if (embeddingProps.isBatchMode()) {
+            // 批量入库模式：IntraOp=1，让 session 走单线程、不抢 CPU；
+            // N 张图并发时整体 CPU 占用可控，每个 session 排队等待本身不会变慢。
+            intraOp = 1;
+            log.info("[DINO 启动] batch-mode=true → IntraOp=1（批量友好，避免抢 CPU）");
+        } else {
+            // 单图搜图模式：让 session 内部多线程榨干 CPU。
+            // 关键：不能超过"session 池同时全借出时的总线程数 ≤ CPU 物理核数"。
+            // 否则上下文切换和锁竞争反而拖慢每张图。
+            int idealIntra = Math.max(1, cpuCores / Math.max(1, sessionPoolSize));
+            // 还要兼容"pool < CPU" 的情况（少数高性能场景，每个 session 多核）
+            // 可以使用多个线程，因为只是查询一张图
+            intraOp = Math.max(clip.getScales().size() * 2, idealIntra);
+            log.info("[CLIP 启动] batch-mode=false → IntraOp={}（cpuCores={}，pool={}，)",
+                    intraOp, cpuCores, sessionPoolSize);
+        }
         try {
             opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
-
-            // [性能] CLIP 推理 batch=1，每个 session 内部算子并行收益不大，反而抢 CPU 拖慢整体。
-            // 设成 1：让并发跑在"多个 session"维度（Java 侧 8 线程 × 8 session），而不是"单 session 多线程"。
-            // 数值上完全等价：单线程 vs 多线程对 ONNX 算子结果是 bit-for-bit 一致的（CPU EP 走的是确定性 C++ kernel）。
-            opts.setIntraOpNumThreads(1);
-            try {
-                // InterOp 在 graph 是单流（CLIP vision 没有 control flow）时无意义，显式关掉
-                opts.setInterOpNumThreads(1);
-            } catch (NoSuchMethodError ignore) {
-                // 老版本 ort-java 没有这个 API（<1.10），忽略即可
-            }
+            opts.setIntraOpNumThreads(intraOp);
+            opts.setInterOpNumThreads(intraOp);  // 显式设 1：DINOv2 forward 是严格顺序的 transformer 链
+            // InterOp>1 在 ViT 上收益 < 2%，但线程切换成本反而增加。
         } catch (OrtException e) {
             throw new RuntimeException(e);
         }
@@ -216,10 +241,10 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     private void ensureModelFile(Path p, String tower) throws IOException {
         if (!Files.exists(p)) {
             throw new IOException(
-                "\n[CLIP] " + tower + "模型文件找不到: " + p.toAbsolutePath() + "\n" +
-                "[CLIP] 请检查 application.yml 中 embedding.clip." +
-                (tower.contains("视") ? "vision-model-path" : "text-model-path") + " 是否正确\n" +
-                "[CLIP] 也可以用 scripts\\download-clip-model.ps1 重新下载"
+                    "\n[CLIP] " + tower + "模型文件找不到: " + p.toAbsolutePath() + "\n" +
+                            "[CLIP] 请检查 application.yml 中 embedding.clip." +
+                            (tower.contains("视") ? "vision-model-path" : "text-model-path") + " 是否正确\n" +
+                            "[CLIP] 也可以用 scripts\\download-clip-model.ps1 重新下载"
             );
         }
     }
@@ -227,10 +252,10 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     /**
      * 解析模型路径：yml 写啥就是啥。
      * 解析规则：
-     *   1) 如果是绝对路径且文件存在，直接用
-     *   2) 否则尝试 classpath: 相对路径（最常用：放在 src/main/resources/ 下随 JAR 分发）
-     *   3) 否则尝试工作目录相对路径
-     *   4) 都不存在就把原路径返回出去，由 ensureModelFile 抛具体错
+     * 1) 如果是绝对路径且文件存在，直接用
+     * 2) 否则尝试 classpath: 相对路径（最常用：放在 src/main/resources/ 下随 JAR 分发）
+     * 3) 否则尝试工作目录相对路径
+     * 4) 都不存在就把原路径返回出去，由 ensureModelFile 抛具体错
      */
     private Path resolveModelPath(String configPath, String tower) {
         if (configPath == null || configPath.isEmpty()) {
@@ -274,7 +299,11 @@ public class ClipFeatureExtractor implements FeatureExtractor {
             OrtSession s;
             int count = 0;
             while ((s = VISION_POOL.pollFirst()) != null) {
-                try { s.close(); count++; } catch (Exception ignored) {}
+                try {
+                    s.close();
+                    count++;
+                } catch (Exception ignored) {
+                }
             }
             log.info("[CLIP 关闭] 已销毁 {} 个 session，pool size={}", count, VISION_POOL.size());
         }
@@ -284,6 +313,30 @@ public class ClipFeatureExtractor implements FeatureExtractor {
 
     @Override
     public float[] extractFeature(File imageFile) throws IOException {
+        return extractFeature(imageFile, null);
+    }
+
+    @Override
+    public float[] extractFeature(InputStream inputStream) throws IOException {
+        return extractFeature(inputStream, null);
+    }
+
+    @Override
+    public float[] extractFeature(byte[] imageBytes) throws IOException {
+        return extractFeature(imageBytes, null);
+    }
+
+    /**
+     * 单图特征提取（可选：传入 ExecutorService 触发单图内多尺度并发）。
+     *
+     * <p>传入 executor 后，CLIP 的多个尺度 [192,224,256] 会并发提交到线程池，借不同 session
+     * 真正并行推理。3 个尺度的总耗时 ≈ max(t_192, t_224, t_256) 而不是 sum。
+     * session 池容量需 ≥ scales.length（默认 16 个 session，3 个尺度完全够用）。
+     *
+     * <p>executor == null 时退化为串行多尺度（保持与原行为一致）。
+     */
+    @Override
+    public float[] extractFeature(File imageFile, ExecutorService exec) throws IOException {
         if (imageFile == null || !imageFile.exists() || imageFile.length() == 0) {
             throw new IOException("图像文件不可读 (不存在或为空): " + (imageFile == null ? "<null>" : imageFile.getAbsolutePath()));
         }
@@ -291,43 +344,46 @@ public class ClipFeatureExtractor implements FeatureExtractor {
         if (img == null) {
             throw new IOException("无法解码图像: " + imageFile.getAbsolutePath() + " (格式不支持或文件损坏)");
         }
-        return extractFeatureFromBufferedImage(img);
+        return extractFeatureFromBufferedImage(img, exec);
     }
 
     @Override
-    public float[] extractFeature(InputStream inputStream) throws IOException {
+    public float[] extractFeature(InputStream inputStream, ExecutorService exec) throws IOException {
         BufferedImage img = ImageIO.read(inputStream);
         if (img == null) {
             throw new IOException("无法解码图像 (InputStream): 格式不支持或流已损坏");
         }
-        return extractFeatureFromBufferedImage(img);
+        return extractFeatureFromBufferedImage(img, exec);
     }
 
     @Override
-    public float[] extractFeature(byte[] imageBytes) throws IOException {
+    public float[] extractFeature(byte[] imageBytes, ExecutorService exec) throws IOException {
         return extractFeatureFromBufferedImage(
-                ImageIO.read(new java.io.ByteArrayInputStream(imageBytes)));
+                ImageIO.read(new java.io.ByteArrayInputStream(imageBytes)), exec);
     }
 
     /**
      * 核心：把图片送进 CLIP ONNX 模型，取 [CLS] embedding，512 维
-     *
+     * <p>
      * 预处理策略（可通过 embedding.clip.scales 配置）：
-     *   - 单尺度 224：标准的 CLIP center crop
-     *   - 多尺度如 224,256：每个尺度处理成 224×224 再进 ONNX，embedding 算术平均再 L2 归一化
-     *     * 224：标准尺度，和训练一致，基准参考
-     *     * 256：center crop 后保留更多细节纹理
-     *   - 比 crop 小的尺度（如 192）：resize 后不足 224 的部分用黑边居中 pad 到 224×224
-     *
+     * - 单尺度 224：标准的 CLIP center crop
+     * - 多尺度如 224,256：每个尺度处理成 224×224 再进 ONNX，embedding 算术平均再 L2 归一化
+     * * 224：标准尺度，和训练一致，基准参考
+     * * 256：center crop 后保留更多细节纹理
+     * - 比 crop 小的尺度（如 192）：resize 后不足 224 的部分用黑边居中 pad 到 224×224
+     * <p>
      * 水平翻转增强（可通过 embedding.clip.hflip-enabled 启用）：
-     *   - 原图 + 水平翻转各跑一遍多尺度，取平均
-     *   - 消除 CLIP 对翻转图 embedding 的轻微扰动，约 +1~3% 召回
-     *
+     * - 原图 + 水平翻转各跑一遍多尺度，取平均
+     * - 消除 CLIP 对翻转图 embedding 的轻微扰动，约 +1~3% 召回
+     * <p>
      * 线程安全：从 VISION_POOL 借一个 session → run → 归还到池里。
      * session 始终在 finally 里归还，路径异常也不会泄漏。
      * 多线程可同时调用本方法（互不竞争 session，每个 session 独立持有 native 状态）。
+     *
+     * @param scaleExecutor 可选：传入非空时启用"单图内多尺度并发"，N 个尺度借不同 session 并行推理。
+     *                      session 池容量必须 ≥ scales.length，否则会因借不到 session 而退化为串行（仍能跑通）。
      */
-    private float[] extractFeatureFromBufferedImage(BufferedImage image) throws IOException {
+    private float[] extractFeatureFromBufferedImage(BufferedImage image, ExecutorService scaleExecutor) throws IOException {
         if (image == null) {
             throw new IOException("图片读取失败");
         }
@@ -344,13 +400,13 @@ public class ClipFeatureExtractor implements FeatureExtractor {
 
         try {
             // 1) 原图多尺度平均
-            embOriginal = runMultiScale(rgb);
+            embOriginal = runMultiScale(rgb, scaleExecutor);
             avgLen = embOriginal.length;
 
             // 2) 水平翻转多尺度平均（如果启用）
             if (embeddingProps.getClip().isHflipEnabled()) {
                 BufferedImage flipped = flipHorizontal(rgb);
-                embFlipped = runMultiScale(flipped);
+                embFlipped = runMultiScale(flipped, scaleExecutor);
                 if (embFlipped.length != avgLen) {
                     log.warn("[CLIP HFlip] 翻转图维度 {} 与原图 {} 不一致，跳过翻转增强", embFlipped.length, avgLen);
                 } else {
@@ -370,8 +426,37 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     /**
      * 对给定图片跑多尺度推理，返回 L2 归一化前的平均 embedding。
      * 尺度由 this.scales 配置决定。
+     *
+     * <p>并发策略（按调用方意图区分）：
+     * <ul>
+     *   <li>{@code scaleExecutor == null}：调用方是同步直接调用（典型场景：单图搜图，前端等结果）。
+     *       走 {@link ForkJoinPool#commonPool()} 多尺度并发，单图耗时 ≈ max 而不是 sum。</li>
+     *   <li>{@code scaleExecutor != null}：调用方正在把整批请求提交到一个池子里（典型场景：批量入库）。
+     *       <b>强制走串行多尺度</b>。原因：外层池（如 feature-threads）已经塞满，再向它或 commonPool
+     *       invokeAll 提交尺度子任务会与外层调度线程争资源，要么死锁、要么白白增加上下文切换和锁竞争，
+     *       整体 throughput 反而下降。串行多尺度在这个场景下是最优解。</li>
+     * </ul>
+     *
+     * @param scaleExecutor 非 null 表示"我在批量池里跑，请串行"；null 表示"我是孤立的单图调用，请并发加速"
      */
-    private float[] runMultiScale(BufferedImage rgb) throws IOException {
+    private float[] runMultiScale(BufferedImage rgb, ExecutorService scaleExecutor) throws IOException {
+        // 单尺度 → 串行（无并发收益）
+        if (scales.length <= 1) {
+            return runMultiScaleSerial(rgb);
+        }
+        // 批量入库场景：调用方传了池子进来，强制串行多尺度
+        if (scaleExecutor != null) {
+            return runMultiScaleSerial(rgb);
+        }
+        // 单图搜图场景：调用方没传池子，走 commonPool 多尺度并发
+        ForkJoinPool pool = ForkJoinPool.commonPool();
+        if (pool.getParallelism() < 2) {
+            return runMultiScaleSerial(rgb);
+        }
+        return runMultiScaleParallel(rgb);
+    }
+
+    private float[] runMultiScaleSerial(BufferedImage rgb) throws IOException {
         int avgLen = -1;
         float[] avg = null;
         int validScales = 0;
@@ -400,7 +485,7 @@ public class ClipFeatureExtractor implements FeatureExtractor {
                 Graphics2D g = tensorInput.createGraphics();
                 g.setColor(Color.BLACK);
                 g.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
-                int offX = (IMG_SIZE - resized.getWidth())  / 2;
+                int offX = (IMG_SIZE - resized.getWidth()) / 2;
                 int offY = (IMG_SIZE - resized.getHeight()) / 2;
                 g.drawImage(resized, offX, offY, null);
                 g.dispose();
@@ -429,6 +514,116 @@ public class ClipFeatureExtractor implements FeatureExtractor {
         // 所有尺度都被 skip（极小图），用单尺度兜底
         if (avg == null || validScales == 0) {
             log.warn("[CLIP 多尺度] 所有尺度都不可用（原图 {}x{}），降级到单尺度", rgb.getWidth(), rgb.getHeight());
+            return runSingleScaleFallback(rgb);
+        }
+        return avg;
+    }
+
+    /**
+     * 多尺度并发：调用线程串行完成所有尺度的 resize/crop（输出 N 张 224×224 BufferedImage），
+     * 然后 invokeAll 提交到 {@link ForkJoinPool#commonPool()} 跑 N 个 inference 任务。
+     *
+     * <p>此方法仅在调用方传 {@code null} 时进入（即单图搜图场景，请求方不在任何池里跑），
+     * 用 JVM 全局 commonPool 即可，无需借用调用方的池。
+     *
+     * <p>守卫：单图并发任务数 > session 池容量时会因 borrowVisionSession 锁等待而退化为串行，
+     * 所以 {@link #runMultiScale} 入口已经判过 pool parallelism，不够则不走此方法。
+     */
+    private float[] runMultiScaleParallel(BufferedImage rgb) throws IOException {
+        int n = scales.length;
+
+        // 1) 在调用线程里完成所有尺度的 resize/crop —— BufferedImage 共享给子任务只读使用
+        BufferedImage[] tensorInputs = new BufferedImage[n];
+        int[] targetShorts = new int[n];
+        for (int si = 0; si < n; si++) {
+            int targetShort = scales[si];
+            targetShorts[si] = targetShort;
+            int w = rgb.getWidth();
+            int h = rgb.getHeight();
+            int newW, newH;
+            if (w < h) {
+                newW = targetShort;
+                newH = (int) Math.round((float) h * targetShort / w);
+            } else {
+                newH = targetShort;
+                newW = (int) Math.round((float) w * targetShort / h);
+            }
+            BufferedImage resized = resizeDirect(rgb, newW, newH);
+
+            // 比 crop 小的尺度：pad 黑边到 224×224 再进 ONNX
+            BufferedImage tensorInput;
+            if (resized.getWidth() < IMG_SIZE || resized.getHeight() < IMG_SIZE) {
+                tensorInput = new BufferedImage(IMG_SIZE, IMG_SIZE, BufferedImage.TYPE_INT_RGB);
+                Graphics2D g = tensorInput.createGraphics();
+                try {
+                    g.setColor(Color.BLACK);
+                    g.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
+                    int offX = (IMG_SIZE - resized.getWidth()) / 2;
+                    int offY = (IMG_SIZE - resized.getHeight()) / 2;
+                    g.drawImage(resized, offX, offY, null);
+                } finally {
+                    g.dispose();
+                }
+            } else {
+                tensorInput = centerCrop(resized, IMG_SIZE, IMG_SIZE);
+            }
+            tensorInputs[si] = tensorInput;
+        }
+
+        // 2) 提交到 ForkJoinPool.commonPool：每个任务自己借一个 session，跑一个尺度
+        //    注意：每个任务要自己 NEW 自己的 [1][3][224][224] float[][][][] 复用 buffer，
+        //    不能共享（否则多线程同时写入会数据竞争）。
+        List<java.util.concurrent.Callable<float[]>> tasks = new ArrayList<>(n);
+        for (int si = 0; si < n; si++) {
+            final int idx = si;
+            tasks.add(() -> {
+                float[][][][] reuse = new float[1][3][IMG_SIZE][IMG_SIZE];
+                return runInference(tensorInputs[idx], reuse);
+            });
+        }
+
+        int avgLen = -1;
+        float[] avg = null;
+        int validScales = 0;
+        long t0 = System.currentTimeMillis();
+        try {
+            // 单图搜图场景下的多尺度并发加速：3 个尺度的 ONNX 推理并行执行，单图耗时 ≈ max 而不是 sum。
+            // 走 commonPool 而非调用方传入的池，因为调用方传 null（即"我不在任何池里跑"），
+            // 没有任何"调用方所在的外层池"可以借用，只能用 JVM 全局的 commonPool。
+            List<java.util.concurrent.Future<float[]>> futures = ForkJoinPool.commonPool().invokeAll(tasks);
+            for (int si = 0; si < futures.size(); si++) {
+                float[] emb;
+                try {
+                    emb = futures.get(si).get();
+                } catch (java.util.concurrent.ExecutionException e) {
+                    log.warn("[CLIP 多尺度并发] 尺度 {} 推理失败: {}", targetShorts[si],
+                            e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
+                    continue;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("CLIP 多尺度并发被中断", e);
+                }
+                if (avg == null) {
+                    avgLen = emb.length;
+                    avg = new float[avgLen];
+                } else if (emb.length != avgLen) {
+                    log.warn("[CLIP 多尺度并发] 尺度 {} 维度 {} 与首尺度 {} 不一致，跳过",
+                            targetShorts[si], emb.length, avgLen);
+                    continue;
+                }
+                validScales++;
+                float scale = 1.0f / n;
+                for (int i = 0; i < avgLen; i++) avg[i] += emb[i] * scale;
+            }
+            log.debug("[CLIP 多尺度并发] scales={} | 总等待 {}ms | 有效 {}/{}",
+                    Arrays.toString(scales), System.currentTimeMillis() - t0, validScales, n);
+        } catch (Exception e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("CLIP 多尺度并发被中断", e);
+        }
+
+        if (avg == null || validScales == 0) {
+            log.warn("[CLIP 多尺度并发] 所有尺度都不可用，降级到单尺度串行");
             return runSingleScaleFallback(rgb);
         }
         return avg;
@@ -494,7 +689,7 @@ public class ClipFeatureExtractor implements FeatureExtractor {
      * [B] 把 cropped 224x224 BufferedImage 转成 [1][3][224][224] float
      * 用 Raster.getPixels() 一次性把整张图读进 int[]，省掉 BufferedImage.getRGB 的越界检查/重载分发。
      * JNI 调用从 224 次（一次一行）→ 1 次（整张图）。
-     *
+     * <p>
      * 数值上与原先"逐点 getRGB"完全等价：((argb >> 16) & 0xFF) / 255f 等等。
      */
     private static float[][][][] toChw(BufferedImage cropped) {
@@ -541,11 +736,11 @@ public class ClipFeatureExtractor implements FeatureExtractor {
 
     /**
      * CLIP 标准预处理：
-     *  1. 转 RGB（去 alpha）
-     *  2. 等比例 resize，短边缩到 256
-     *  3. CenterCrop 到 224x224（居中裁剪）
-     *  4. 转 float32 [0,1]，CLIP mean/std 归一化
-     *  5. NCHW → [1][3][224][224]
+     * 1. 转 RGB（去 alpha）
+     * 2. 等比例 resize，短边缩到 256
+     * 3. CenterCrop 到 224x224（居中裁剪）
+     * 4. 转 float32 [0,1]，CLIP mean/std 归一化
+     * 5. NCHW → [1][3][224][224]
      */
     private float[][][][] preprocess(BufferedImage src) {
         BufferedImage rgb = toRgb(src);
@@ -651,9 +846,9 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     /**
      * 从 ONNX 输出 (可能是 float[][] 或 ArrayList) 里取出第一个向量
      * ONNX Runtime Java 的输出包装形态有 3 种：
-     *   - float[][]                 (2D: [batch, dim])
-     *   - Object[] / List<float[]>  (1D: [batch] -> float[])
-     *   - float[][][] / List<List<float[]>>  (3D，理论上有，CLIP 不会出)
+     * - float[][]                 (2D: [batch, dim])
+     * - Object[] / List<float[]>  (1D: [batch] -> float[])
+     * - float[][][] / List<List<float[]>>  (3D，理论上有，CLIP 不会出)
      */
     private static float[] extractFirstRow(Object output) {
         if (output instanceof float[][] arr) {
@@ -691,9 +886,9 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     /**
      * [A 头探测] 启动期跑一次 dummy 输入，把每个输出头的 shape / 维度 / 长度打出来。
      * 用来判断：
-     *   1) 输出头是 image_embeds（512 投影后） 还是 vision_model（768 投影前）
-     *   2) 当前代码 extractFirstRow 路径能不能正确取出
-     *
+     * 1) 输出头是 image_embeds（512 投影后） 还是 vision_model（768 投影前）
+     * 2) 当前代码 extractFirstRow 路径能不能正确取出
+     * <p>
      * 不会修改任何状态，不写库、不入库；只打日志。
      */
     private void probeVisionHeads(OrtSession session) {
@@ -746,12 +941,13 @@ public class ClipFeatureExtractor implements FeatureExtractor {
                     OnnxValue imgOv = null;
                     try {
                         imgOv = result.get("image_embeds").get();
-                    } catch (Exception ignored) {}
+                    } catch (Exception ignored) {
+                    }
                     if (imgOv instanceof OnnxTensor ot) {
                         Object v = ot.getValue();
                         int d = (v instanceof float[][] a) ? a[0].length
                                 : (v instanceof List<?> l && !l.isEmpty() && l.get(0) instanceof float[] fr) ? fr.length
-                                : -1;
+                                  : -1;
                         if (d == 512) {
                             log.info("[CLIP 头探测] ✅  找到 image_embeds[512] —— 当前代码 result.get(0) 拿到的是 [0]号输出头。"
                                     + "若 [0] = image_embeds，512 维投影后特征，OK；若 [0] = logits_per_image (1,768)，那你的代码在错读 logits！");
@@ -772,20 +968,21 @@ public class ClipFeatureExtractor implements FeatureExtractor {
                         Object val = ot2.getValue();
                         int d = -1;
                         if (val instanceof float[][] arr && arr.length > 0) d = arr[0].length;
-                        else if (val instanceof List<?> list && !list.isEmpty() && list.get(0) instanceof float[] fr) d = fr.length;
+                        else if (val instanceof List<?> list && !list.isEmpty() && list.get(0) instanceof float[] fr)
+                            d = fr.length;
                         if (d > realDim) realDim = d;
                     }
                     log.info("[CLIP 头探测] yml.feature-dim = {} | 推理输出最大维度 = {}",
                             embeddingProps.getClip().getFeatureDim(), realDim);
                     if (realDim > 0 && realDim != embeddingProps.getClip().getFeatureDim()) {
                         throw new IllegalStateException(String.format(
-                            "[CLIP] 维度不一致！application.yml 里 embedding.clip.feature-dim=%d，但模型实际输出维度=%d。%n"
-                          + "[CLIP] Milvus collection 的 dim 字段必须与 feature-dim 一致，否则会 0 召回。%n"
-                          + "[CLIP] 修复方法：%n"
-                          + "  1) 修改 application.yml 的 embedding.clip.feature-dim=%d%n"
-                          + "  2) 删除已有 collection（schema 已锁），重新建表%n"
-                          + "  3) 重新入库所有图片",
-                            embeddingProps.getClip().getFeatureDim(), realDim, realDim));
+                                "[CLIP] 维度不一致！application.yml 里 embedding.clip.feature-dim=%d，但模型实际输出维度=%d。%n"
+                                        + "[CLIP] Milvus collection 的 dim 字段必须与 feature-dim 一致，否则会 0 召回。%n"
+                                        + "[CLIP] 修复方法：%n"
+                                        + "  1) 修改 application.yml 的 embedding.clip.feature-dim=%d%n"
+                                        + "  2) 删除已有 collection（schema 已锁），重新建表%n"
+                                        + "  3) 重新入库所有图片",
+                                embeddingProps.getClip().getFeatureDim(), realDim, realDim));
                     }
                     log.info("[CLIP 头探测] ✅ 维度校验通过：feature-dim={} 与推理输出一致",
                             embeddingProps.getClip().getFeatureDim());

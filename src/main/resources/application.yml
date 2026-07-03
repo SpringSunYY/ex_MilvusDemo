@@ -31,15 +31,20 @@ milvus:
 # 特征提取配置（支持多模型扩展：CLIP / DINOv2 / SigLIP 等）
 # ==============================================================
 embedding:
-  # 当前激活的模型：clip
-  model: dino
+  # 当前激活的模型
+  model: siglip
   # 推理设备：cpu / cuda
   device: cpu
   # 批量推理 batch size
   batch-size: 32
   # 批量入库时的特征提取并行线程数（与 dino.session-pool-size 对齐）
   feature-threads: 16
-
+  # ============================================================
+  # ONNX Runtime IntraOp 策略（启动期一次性选定，运行时不可改）
+  # ============================================================
+  # 批量入库场景（同时跑批量 + 搜图或者又高并发场景）→ 设 true：IntraOp=1，16 张图并发时不抢 CPU
+  # 纯搜图场景（只用搜图）        → 设 false：IntraOp=CPU/6，让 session 内部多线程榨干 CPU
+  batch-mode: true
   # CLIP 模型配置
   clip:
     # 模型路径（相对于 classpath / 工作目录）
@@ -60,7 +65,6 @@ embedding:
       - 256
     # 水平翻转增强
     hflip-enabled: true
-
   # ==============================================================
   # SigLIP 2 模型配置（Google 2025 新模型，精度比 CLIP 高 1-3%）
   # SigLIP ViT-B/16 = 768 维向量
@@ -78,10 +82,11 @@ embedding:
     input-size: 256
     # 多尺度推理的短边尺寸列表
     scales:
+      - 224
       - 256
+      - 384
     # 水平翻转增强
-    hflip-enabled: false
-
+    hflip-enabled: true
   # ==============================================================
   # DINOv2 模型配置（Meta 纯视觉模型，细粒度特征提取最强）
   # DINOv2 ViT-B/14 = 768 维向量；ViT-L/14 = 1024 维向量
@@ -92,7 +97,9 @@ embedding:
     # ONNX 模型路径
     vision-model-path: E:\Java\Code\MyStudy\Milvus\Models\dino\model.onnx
     # 视觉塔 OrtSession 池大小
-    # 注意：ViT-L 模型非常大，session 建议 1-2 个；ViT-B 可开 4-8 个
+    # 关键：pool × intraOp 不能超过 CPU 物理核数。
+    # pool 太大 + intraOp 太大会导致线程切换风暴，反而比少量 session 多线程慢。
+    # 推荐：0 = 自动 min(CPU 核数, 8)；手工指定时建议 ≤ CPU 核数 / 2
     session-pool-size: 16
     # 输出向量维度（启动期 probeHeads 会自动校验）
     feature-dim: 768
@@ -107,9 +114,3 @@ embedding:
       - 448
     # 水平翻转增强（不建议开启，DINOv2 对翻转敏感）
     hflip-enabled: false
-    # ============================================================
-    # ONNX Runtime IntraOp 策略（启动期一次性选定，运行时不可改）
-    # ============================================================
-    # 批量入库场景（同时跑批量 + 搜图）→ 设 true：IntraOp=1，16 张图并发时不抢 CPU
-    # 纯搜图场景（只用搜图）        → 设 false：IntraOp=CPU/6，让 session 内部多线程榨干 CPU
-    batch-mode: false

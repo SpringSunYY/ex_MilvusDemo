@@ -55,19 +55,17 @@ public interface FeatureExtractor {
     float[] extractFeature(byte[] imageBytes) throws IOException;
 
     /**
-     * 可选：把特征提取时传入线程池。
+     * 可选：传入调用方所在的特征提取线程池。
      * <p>
-     * 对于多尺度 / HFlip 等"同一张图需要多次 ONNX 推理"的模型，传入 ExecutorService 后可以让多次推理
-     * 真正并发执行（每次推理借不同 session），单张图耗时 ≈ max 而不是 sum。
-     * <p>
-     * 调用方约定：
+     * 该参数作为<b>意图信号</b>传给实现：
      * <ul>
-     *   <li>传 {@code null} → 不并发（与不带 executor 的版本等价）</li>
-     *   <li>传非空 → 调用方负责保证容量充足，否则实现内部可能同步等待 session</li>
+     *   <li>{@code null}：调用方是同步直接调用（如单图搜图，前端等结果）。实现可选择走
+     *       {@link java.util.concurrent.ForkJoinPool#commonPool()} 多尺度并发加速，单图耗时 ≈ max 而不是 sum。</li>
+     *   <li>非 null：调用方正在把整批请求提交到一个池子里（如批量入库），外层池（feature-threads）已塞满。
+     *       实现应<b>走串行多尺度</b>，避免与外层池争资源、拖慢整体 throughput、甚至触发"外层占满 → 内部 invokeAll 再占满外层"的死锁。</li>
      * </ul>
      * <p>
-     * 默认实现把任务转发到无 executor 的版本，等价于不并发；
-     * 支持并发的模型（如 DINOv2）应当 override 此方法。
+     * 默认实现把任务转发到无 executor 的版本（串行多尺度）。支持单图搜图并发的模型应当 override 此方法。
      */
     default float[] extractFeature(File imageFile, ExecutorService exec) throws IOException {
         return extractFeature(imageFile);

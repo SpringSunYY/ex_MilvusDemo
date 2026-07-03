@@ -22,10 +22,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.List;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -89,6 +86,11 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     private final ThreadLocal<int[]> pixelBuffer =
             ThreadLocal.withInitial(() -> new int[448 * 448]);
 
+    // ============ 诊断用采样计数器（临时：批量入库定位瓶颈，跑完后可删除）============
+    private final java.util.concurrent.atomic.AtomicInteger diagSample = new java.util.concurrent.atomic.AtomicInteger(0);
+    // [诊断] 采样：每 10 张采 1 张 + 最后 1 张。这样 32 张跑出 4 张详细分解。
+    private static final int DIAG_EVERY = 10;
+
     private static final Deque<OrtSession> POOL = new ArrayDeque<>();
     private static volatile boolean initialized = false;
     private static final AtomicInteger INSTANCE_COUNT = new AtomicInteger(0);
@@ -121,7 +123,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         modelPath = resolveModelPath(dino.getVisionModelPath(), "DINOv2");
         ensureModelFile(modelPath, "DINOv2");
 
-        int poolSize = resolvePoolSize(dino.getSessionPoolSize());
+        int poolSize = resolvePoolSize(dino.getSessionPoolSize(),dino.getScales().size());
         log.info("[DINO 启动] 初始化 {} 个 session ...", poolSize);
 
         OrtSession.SessionOptions opts = buildOpts(poolSize);
@@ -183,10 +185,10 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         log.info("[DINO 启动] 初始化完成，pool 最终 size={}", POOL.size());
     }
 
-    private static int resolvePoolSize(int configured) {
+    private static int resolvePoolSize(int configured, int scaleCount) {
         if (configured > 0) return configured;
         int cores = Math.max(1, Runtime.getRuntime().availableProcessors());
-        return Math.min(cores, 8);
+        return Math.min(cores, scaleCount);
     }
 
     private static int[] parseScales(List<Integer> list) {
@@ -203,6 +205,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     }
 
     private OrtSession borrowSession() throws OrtException {
+        long waitStart = System.nanoTime();
         synchronized (POOL) {
             int waitCount = 0;
             while (POOL.isEmpty()) {
@@ -221,6 +224,12 @@ public class DinoFeatureExtractor implements FeatureExtractor {
             // 把非阻塞的统计和日志挪到锁外：减少 synchronized 块持有时间
             int borrowed = poolSizeEstimate() - POOL.size();
             if (borrowed > peakBorrowed.get()) peakBorrowed.set(borrowed);
+            // [诊断] 只在确实等了才打，避免每张图都刷一堆 0ms
+            long waitNs = System.nanoTime() - waitStart;
+            if (waitNs > 1_000_000L) {
+                log.info("[DINO 步骤] borrowSession waited {}ms (pool now borrowed={})",
+                        waitNs / 1_000_000L, borrowed);
+            }
             return s;
         }
     }
@@ -245,25 +254,30 @@ public class DinoFeatureExtractor implements FeatureExtractor {
 
     private OrtSession.SessionOptions buildOpts(int sessionPoolSize) {
         OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
-        var dino = embeddingProps.getDino();
+        EmbeddingProperties.DinoProperties dino = embeddingProps.getDino();
         int intraOp;
-        if (dino.isBatchMode()) {
+        int cpuCores = Runtime.getRuntime().availableProcessors();
+        if (embeddingProps.isBatchMode()) {
             // 批量入库模式：IntraOp=1，让 session 走单线程、不抢 CPU；
             // N 张图并发时整体 CPU 占用可控，每个 session 排队等待本身不会变慢。
             intraOp = 1;
             log.info("[DINO 启动] batch-mode=true → IntraOp=1（批量友好，避免抢 CPU）");
         } else {
-            // CPU 线程数至少 2，单图时性能高
-            intraOp = Math.max(2, sessionPoolSize / Math.max(2, this.scales.length));
-            log.info("[DINO 启动] batch-mode=false → IntraOp={}（pool={}，搜图加速）",
-                    intraOp, sessionPoolSize);
+            // 单图搜图模式：让 session 内部多线程榨干 CPU。
+            // 关键：不能超过"session 池同时全借出时的总线程数 ≤ CPU 物理核数"。
+            // 否则上下文切换和锁竞争反而拖慢每张图。
+            int idealIntra = Math.max(1, cpuCores / Math.max(1, sessionPoolSize));
+            // 还要兼容"pool < CPU" 的情况（少数高性能场景，每个 session 多核）
+            // 可以使用多个线程，因为只是查询一张图
+            intraOp = Math.max(dino.getScales().size() * 2, idealIntra);
+            log.info("[DINO 启动] batch-mode=false → IntraOp={}（cpuCores={}，pool={}，",
+                    intraOp, cpuCores, sessionPoolSize);
         }
         try {
             opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
             opts.setIntraOpNumThreads(intraOp);
-            opts.setInterOpNumThreads(intraOp);
-            // InterOp 不显式设置 = 1（ORT 默认）。DINOv2 forward 是严格顺序的
-            // transformer 链，相邻算子无独立可并行维度，InterOp>1 收益 < 2%。
+            opts.setInterOpNumThreads(intraOp);  // 显式设 1：DINOv2 forward 是严格顺序的 transformer 链
+            // InterOp>1 在 ViT 上收益 < 2%，但线程切换成本反而增加。
         } catch (OrtException e) {
             throw new RuntimeException(e);
         }
@@ -336,9 +350,14 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         if (imageFile == null || !imageFile.exists() || imageFile.length() == 0) {
             throw new IOException("图像文件不可读: " + (imageFile == null ? "<null>" : imageFile.getAbsolutePath()));
         }
+        long tIo = System.nanoTime();
         BufferedImage img = ImageIO.read(imageFile);
+        long ioNs = System.nanoTime() - tIo;
         if (img == null) {
             throw new IOException("无法解析图像: " + imageFile.getAbsolutePath());
+        }
+        if (ioNs > 50_000_000L) {
+            log.info("[DINO 步骤] imageIO={}ms (file={})", ioNs / 1_000_000L, imageFile.getName());
         }
         return extractFeatureFromBufferedImage(img, exec);
     }
@@ -385,32 +404,50 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         }
         long t0 = System.currentTimeMillis();
 
+        long tToRgb = System.nanoTime();
         BufferedImage rgb = toRgb(image);
+        long toRgbNs = System.nanoTime() - tToRgb;
 
         boolean wantHflip = embeddingProps.getDino().isHflipEnabled();
         int total = scales.length * (wantHflip ? 2 : 1);
+
+        // [诊断] 采样：每 DIAG_EVERY 张抽 1 张打五段分解。diag[0..4]: resize, prep, run, borrowWait, failCount
+        int sampleCount = diagSample.incrementAndGet();
+        boolean doDiag = (sampleCount % DIAG_EVERY == 0);
+        long[] diag = doDiag ? new long[5] : null;
 
         try {
             float[] embOriginal;
             float[] embFlipped;
 
-            if (scaleExecutor == null || total <= 1) {
-                // 串行分支：保留与原代码完全一致的行为（兼容所有不走并发的调用方）
-                embOriginal = runMultiScale(rgb, null);
+            // 并发策略（按调用方意图区分）：
+            //   - scaleExecutor != null：调用方正在批量池里跑（如批量入库），强制走串行多尺度。
+            //     原因：外层池（feature-threads）已塞满，并发会争资源、拖慢整体 throughput，甚至死锁。
+            //   - scaleExecutor == null：调用方是同步直接调用（单图搜图）。
+            //     当 total <= initialPoolSize 时走 commonPool 多尺度并发；否则串行兜底（避免 borrowSession 锁等待）。
+            boolean bulkMode = scaleExecutor != null;
+
+            if (bulkMode || total <= 1) {
+                // 串行分支：批量入库场景 + 单尺度场景
+                // 重要：必须直接调 runMultiScaleSerial，**不能**调 runMultiScale(rgb, null)——
+                // 因为 runMultiScale 看到 null + commonPool 容量够会走 runMultiScaleParallel，
+                // 那样 16 个 worker × 3 个尺度 = 48 个并发推理任务，session 池（16 个）瞬间打爆，
+                // 所有 worker 都会卡在 borrowSession 的 POOL.wait() 上。
+                embOriginal = runMultiScaleSerial(rgb, diag);
                 if (wantHflip) {
                     BufferedImage flipped = flipHorizontal(rgb);
-                    embFlipped = runMultiScale(flipped, null);
+                    embFlipped = runMultiScaleSerial(flipped);
                 } else {
                     embFlipped = null;
                 }
             } else if (initialPoolSize > 0 && total > initialPoolSize) {
-                // 守卫：单图并发任务数 > session 池容量时退化为串行，避免锁等待拖慢整体。
+                // 守卫：单图并发任务数 > session 池容量时退化为串行，避免 borrowSession 锁等待拖慢整体。
                 // 例：scales=[224,336,448], sessionPoolSize=2 → total=3 > 2，走串行更稳。
                 log.debug("[DINO 单图] total={} > poolSize={}，退化为串行多尺度", total, initialPoolSize);
-                embOriginal = runMultiScale(rgb, null);
+                embOriginal = runMultiScaleSerial(rgb);
                 if (wantHflip) {
                     BufferedImage flipped = flipHorizontal(rgb);
-                    embFlipped = runMultiScale(flipped, null);
+                    embFlipped = runMultiScaleSerial(flipped);
                 } else {
                     embFlipped = null;
                 }
@@ -454,9 +491,12 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                 }
 
                 long tSubmit = System.currentTimeMillis();
-                List<Future<float[]>> futures = scaleExecutor.invokeAll(tasks);
-                log.debug("[DINO 并发调度] 提交 {} 个任务到 {} 并发执行，invokeAll 等待 {}ms",
-                        total, scaleExecutor, System.currentTimeMillis() - tSubmit);
+                // 单图搜图场景下的多尺度并发加速：scales.length × (1 + hflip) 个 ONNX 推理并行执行，
+                // 单图耗时 ≈ max 而不是 2*max。走 commonPool 而非调用方传入的池——因为此分支
+                // 只在调用方传 null 时才会进入（即"我不在任何池里跑"），没有外层池可以借用。
+                List<Future<float[]>> futures = ForkJoinPool.commonPool().invokeAll(tasks);
+                log.debug("[DINO 并发调度] 提交 {} 个任务到 commonPool 并发执行，invokeAll 等待 {}ms",
+                        total, System.currentTimeMillis() - tSubmit);
 
                 // 3) 收集结果
                 int hflipOffset = scales.length;
@@ -496,10 +536,33 @@ public class DinoFeatureExtractor implements FeatureExtractor {
             }
 
             float[] result = l2Normalize(embOriginal);
+            // branch 标签必须反映真实的执行路径，不能用 scaleExecutor 参数反推
+            // （批量入库场景下 bulkMode 分支直接调 runMultiScaleSerial，所以 branch=serial 但 scaleExecutor != null）
+            String branch;
+            if (bulkMode || total <= 1 || (initialPoolSize > 0 && total > initialPoolSize)) {
+                branch = "serial";
+            } else {
+                branch = "parallel";
+            }
+            long totalMs = System.currentTimeMillis() - t0;
             log.info("[DINO 单图] scales={} | hflip={} | branch={} | dim={} | 耗时 {}ms",
-                    Arrays.toString(scales), wantHflip,
-                    (scaleExecutor == null || total <= 1) ? "serial" : "parallel",
-                    result.length, System.currentTimeMillis() - t0);
+                    Arrays.toString(scales), wantHflip, branch,
+                    result.length, totalMs);
+
+            // [诊断] 采样图打印五段分解：toRgb + (resize+crop) + prep(NCHW) + run(session.run) + borrowWait
+            if (diag != null) {
+                long sumInner = diag[0] + diag[1] + diag[2] + diag[3];
+                long other = totalMs - sumInner - (toRgbNs / 1_000_000L);
+                log.info("[DINO 五段] sample={} | toRgb={}ms | resize+crop={}ms | prep={}ms | run={}ms | borrowWait={}ms | 失败 {} 尺度 | unaccounted={}ms",
+                        sampleCount,
+                        toRgbNs / 1_000_000L,
+                        diag[0],   // resize+crop 累加
+                        diag[1],   // prep 累加
+                        diag[2],   // run 累加
+                        diag[3],   // borrowWait 累加
+                        diag[4],   // fail count
+                        other);
+            }
             return result;
 
         } catch (InterruptedException ie) {
@@ -515,18 +578,47 @@ public class DinoFeatureExtractor implements FeatureExtractor {
 
     /**
      * 多尺度推理：每个尺度跑一次 embedding 再平均。
-     * <p>
-     * 当 {@code scaleExecutor != null} 时，3 个尺度的 {@code runInference} 会被并发提交，
-     * 借 3 个不同的 session 真正并行推理（耗时 ≈ max 而不是 sum）。CPU 16 线程以下机器慎用。
+     *
+     * <p>并发策略（按调用方意图区分）：
+     * <ul>
+     *   <li>{@code scaleExecutor == null}：单图搜图等孤立调用，走 {@link ForkJoinPool#commonPool()} 多尺度并发加速。</li>
+     *   <li>{@code scaleExecutor != null}：批量入库场景，<b>强制走串行多尺度</b>。
+     *       外层池已塞满，并发只会争资源、拖慢整体 throughput。</li>
+     * </ul>
+     *
+     * @param scaleExecutor 非 null 表示"我在批量池里跑，请串行"；null 表示"我是孤立的单图调用，请并发加速"
      */
     private float[] runMultiScale(BufferedImage rgb, ExecutorService scaleExecutor) throws IOException {
-        if (scaleExecutor == null || scales.length <= 1) {
+        if (scales.length <= 1) {
             return runMultiScaleSerial(rgb);
         }
-        return runMultiScaleParallel(rgb, scaleExecutor);
+        if (scaleExecutor != null) {
+            return runMultiScaleSerial(rgb);
+        }
+        ForkJoinPool pool = ForkJoinPool.commonPool();
+        if (pool.getParallelism() < 2) {
+            return runMultiScaleSerial(rgb);
+        }
+        return runMultiScaleParallel(rgb);
     }
 
     private float[] runMultiScaleSerial(BufferedImage rgb) throws IOException {
+        return runMultiScaleSerial(rgb, null);
+    }
+
+    /**
+     * @param diag 如果非 null，调用方会在结束时拿到本次多尺度累计的细分耗时（5 段累加，毫秒）：
+     *             [0] resize+crop累加 [1] prep(NCHW填充)累加 [2] run(session.run)累加
+     *             [3] borrowWait累加 [4] failCount
+     */
+    private float[] runMultiScaleSerial(BufferedImage rgb, long[] diag) throws IOException {
+        if (diag != null) {
+            diag[0] = 0;
+            diag[1] = 0;
+            diag[2] = 0;
+            diag[3] = 0;
+            diag[4] = 0;
+        }
         int avgLen = -1;
         float[] avg = null;
         int validScales = 0;
@@ -543,14 +635,28 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                 newH = targetShort;
                 newW = (int) Math.round((float) w * targetShort / h);
             }
+
+            // 计时：resize + centerCrop
+            long tResize = System.nanoTime();
             BufferedImage resized = resizeDirect(rgb, newW, newH);
             BufferedImage tensorInput = centerCrop(resized, targetShort, targetShort);
+            long resizeNs = System.nanoTime() - tResize;
 
-            long ts0 = System.currentTimeMillis();
             try {
-                float[] emb = runInference(tensorInput, targetShort);
+                // runInference 内部累加到 infDiag[0..2]: [0]=prep [1]=run [2]=borrowWait
+                // 写到一个独立的临时数组，避免和 diag[0]=resize+crop 的语义冲突
+                long[] infDiag = diag != null ? new long[3] : null;
+                float[] emb = runInference(tensorInput, targetShort, infDiag);
+                if (diag != null) {
+                    diag[0] += resizeNs / 1_000_000L;                       // resize+crop
+                    diag[1] += infDiag[0];                                  // prep (NCHW fill)
+                    diag[2] += infDiag[1];                                  // run (session.run)
+                    diag[3] += infDiag[2];                                  // borrowWait
+                }
                 log.debug("[DINO 尺度] scale={} | 推理耗时 {}ms | 当前 {}/{} 个尺度有效",
-                        targetShort, System.currentTimeMillis() - ts0, si + 1, scales.length);
+                        targetShort,
+                        infDiag != null ? (infDiag[0] + infDiag[1] + infDiag[2]) : -1,
+                        si + 1, scales.length);
                 if (avg == null) {
                     avgLen = emb.length;
                     avg = new float[avgLen];
@@ -563,6 +669,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                 float scale = 1.0f / scales.length;
                 for (int i = 0; i < avgLen; i++) avg[i] += emb[i] * scale;
             } catch (Exception e) {
+                if (diag != null) diag[4]++;
                 log.warn("[DINO 多尺度] 尺度 {} 推理失败: {}", targetShort, e.getMessage());
             }
         }
@@ -574,7 +681,16 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         return avg;
     }
 
-    private float[] runMultiScaleParallel(BufferedImage rgb, ExecutorService executor) throws IOException {
+    /**
+     * 多尺度并发：调用线程串行完成所有尺度的 resize/crop（输出 N 张 inputSize×inputSize BufferedImage），
+     * 然后 invokeAll 提交到 {@link ForkJoinPool#commonPool()} 跑 N 个 inference 任务。
+     *
+     * <p>此方法仅在调用方传 {@code null} 时进入（即单图搜图场景，请求方不在任何池里跑），
+     * 用 JVM 全局 commonPool 即可，无需借用调用方的池。
+     *
+     * <p>注意：此方法目前为内部辅助，主要并发调度在 {@link #extractFeatureFromBufferedImage} 主流程里直接走 commonPool。
+     */
+    private float[] runMultiScaleParallel(BufferedImage rgb) throws IOException {
         int n = scales.length;
         List<Callable<float[]>> tasks = new ArrayList<>(n);
 
@@ -613,7 +729,9 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         int validScales = 0;
         long t0 = System.currentTimeMillis();
         try {
-            List<Future<float[]>> futures = executor.invokeAll(tasks);
+            // 单图搜图场景下的多尺度并发加速。此方法仅在调用方传 null 时进入，
+            // 没有任何外层池可借用，用 JVM 全局 commonPool 即可。
+            List<Future<float[]>> futures = ForkJoinPool.commonPool().invokeAll(tasks);
             for (int si = 0; si < futures.size(); si++) {
                 float[] emb;
                 try {
@@ -639,7 +757,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
             }
             log.debug("[DINO 多尺度并发] scales={} | 总等待 {}ms | 有效 {}/{}",
                     Arrays.toString(scales), System.currentTimeMillis() - t0, validScales, n);
-        } catch (InterruptedException e) {
+        } catch (Exception e) {
             Thread.currentThread().interrupt();
             throw new IOException("DINO 多尺度并发被中断", e);
         }
@@ -658,7 +776,19 @@ public class DinoFeatureExtractor implements FeatureExtractor {
      * 本方法只做 NCHW float 填充 + OnnxTensor 构造 + session.run，不再二次缩放。
      */
     private float[] runInference(BufferedImage tensorInput, int size) throws OrtException {
+        return runInference(tensorInput, size, null);
+    }
+
+    /**
+     * @param diag [0] prep累加 [1] run累加 [2] borrowWait累加（毫秒）。null 时不打诊断。
+     */
+    private float[] runInference(BufferedImage tensorInput, int size, long[] diag) throws OrtException {
+        long tBorrow = System.nanoTime();
         OrtSession session = borrowSession();
+        long borrowNs = System.nanoTime() - tBorrow;
+        if (diag != null && borrowNs > 1_000_000L) {
+            diag[2] += borrowNs / 1_000_000L;
+        }
         try {
             long t0 = System.nanoTime();
             // 使用 FloatBuffer 替代 float[][][][]，减少 GC 压力
@@ -674,6 +804,10 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                 try (OrtSession.Result result = session.run(inputs)) {
                     long runNs = System.nanoTime() - t0;
                     recordPerf(prepNs, runNs);
+                    if (diag != null) {
+                        diag[0] += prepNs / 1_000_000L;
+                        diag[1] += runNs / 1_000_000L;
+                    }
                     return extractFirstRow(result.get(0).getValue());
                 }
             }
