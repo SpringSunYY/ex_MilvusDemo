@@ -32,7 +32,7 @@ milvus:
 # ==============================================================
 embedding:
   # 当前激活的模型
-  model: siglip
+  model: dino
   # 推理设备：cpu / cuda
   device: cpu
   # 批量推理 batch size
@@ -44,7 +44,7 @@ embedding:
   # ============================================================
   # 批量入库场景（同时跑批量 + 搜图或者又高并发场景）→ 设 true：IntraOp=1，16 张图并发时不抢 CPU
   # 纯搜图场景（只用搜图）        → 设 false：IntraOp=CPU/6，让 session 内部多线程榨干 CPU
-  batch-mode: true
+  batch-mode: false
   # CLIP 模型配置
   clip:
     # 模型路径（相对于 classpath / 工作目录）
@@ -111,6 +111,5 @@ embedding:
     scales:
       - 224
       - 336
-      - 448
     # 水平翻转增强（不建议开启，DINOv2 对翻转敏感）
     hflip-enabled: false

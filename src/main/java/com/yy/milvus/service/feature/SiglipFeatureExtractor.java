@@ -22,6 +22,9 @@ import java.util.*;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+
 
 /**
  * 基于 ONNX Runtime 的 SigLIP 2 图像特征提取器。
@@ -71,11 +74,11 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
     private final int instanceId = INSTANCE_COUNT.incrementAndGet();
 
     // ===== 性能统计（线程安全） =====
-    private static final java.util.concurrent.atomic.LongAdder TOTAL_INFER_MS = new java.util.concurrent.atomic.LongAdder();
-    private static final java.util.concurrent.atomic.LongAdder TOTAL_PREPROCESS_MS = new java.util.concurrent.atomic.LongAdder();
-    private static final java.util.concurrent.atomic.LongAdder TOTAL_INFER_COUNT = new java.util.concurrent.atomic.LongAdder();
-    private static final java.util.concurrent.atomic.AtomicInteger PEAK_BORROWED = new java.util.concurrent.atomic.AtomicInteger(0);
-    private static final java.util.concurrent.atomic.AtomicInteger CURRENT_BORROWED = new java.util.concurrent.atomic.AtomicInteger(0);
+    private static final LongAdder TOTAL_INFER_MS = new LongAdder();
+    private static final LongAdder TOTAL_PREPROCESS_MS = new LongAdder();
+    private static final LongAdder TOTAL_INFER_COUNT = new LongAdder();
+    private static final AtomicInteger PEAK_BORROWED = new AtomicInteger(0);
+    private static final AtomicInteger CURRENT_BORROWED = new AtomicInteger(0);
     private static volatile long LAST_STATS_LOG_MS = System.currentTimeMillis();
     private static final long STATS_LOG_INTERVAL_MS = 10_000L; // 10 秒打一次性能摘要
 
@@ -146,15 +149,11 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         return Math.min(cores, scaleCount);
     }
 
+    /**
+     * 解析多尺度列表，逻辑与 Dino/CLIP 同源，已统一到 {@link FeatureExtractorUtils#parseScales}。
+     */
     private static int[] parseScales(List<Integer> list) {
-        if (list == null || list.isEmpty()) return new int[]{DEFAULT_IMG_SIZE};
-        int[] result = new int[list.size()];
-        for (int i = 0; i < list.size(); i++) {
-            int v = list.get(i);
-            if (v < 32) throw new IllegalArgumentException("[SigLIP] scales 最小值为 32，当前: " + v);
-            result[i] = v;
-        }
-        return result;
+        return FeatureExtractorUtils.parseScales(list, DEFAULT_IMG_SIZE, "SigLIP", 32);
     }
 
     private OrtSession borrowSession() throws OrtException {
@@ -191,39 +190,21 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                 CURRENT_BORROWED.get(), PEAK_BORROWED.get());
     }
 
-    private static final java.util.concurrent.atomic.AtomicLong LAST_STATS_LOG_MS_HOLDER = new java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis());
+    private static final AtomicLong LAST_STATS_LOG_MS_HOLDER = new AtomicLong(System.currentTimeMillis());
 
     private static boolean LAST_STATS_LOG_MS_CAS(long expected, long update) {
         return LAST_STATS_LOG_MS_HOLDER.compareAndSet(expected, update);
     }
 
     private OrtSession.SessionOptions buildOpts(int sessionPoolSize) {
-        OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
         EmbeddingProperties.SiglipProperties siglip = embeddingProps.getSiglip();
-        int intraOp;
-        int cpuCores = Runtime.getRuntime().availableProcessors();
-        if (embeddingProps.isBatchMode()) {
-            // 批量入库模式：IntraOp=1，让 session 走单线程、不抢 CPU；
-            // N 张图并发时整体 CPU 占用可控，每个 session 排队等待本身不会变慢。
-            intraOp = 1;
-            log.info("[DINO 启动] batch-mode=true → IntraOp=1（批量友好，避免抢 CPU）");
-        } else {
-            // 单图搜图模式：让 session 内部多线程榨干 CPU。
-            // 关键：不能超过"session 池同时全借出时的总线程数 ≤ CPU 物理核数"。
-            // 否则上下文切换和锁竞争反而拖慢每张图。
-            int idealIntra = Math.max(1, cpuCores / Math.max(1, sessionPoolSize));
-            // 还要兼容"pool < CPU" 的情况（少数高性能场景，每个 session 多核）
-            // 可以使用多个线程，因为只是查询一张图
-            intraOp = Math.max(siglip.getScales().size() * 2, idealIntra);
-            log.info("[Siglip 启动] batch-mode=false → IntraOp={}（cpuCores={}，pool={}，",
-                    intraOp, cpuCores, sessionPoolSize);
-        }
+        // 通用部分已统一到 utils；SigLIP 额外显式 setExecutionMode(SEQUENTIAL)
+        // —— SigLIP ONNX 导出有显式 control flow，不允许 ORT 并行调度 node 之间的依赖。
+        OrtSession.SessionOptions opts = FeatureExtractorUtils.buildOrtSessionOptions(
+                log, "SigLIP", embeddingProps.isBatchMode(),
+                siglip.getScales().size(), sessionPoolSize);
         try {
-            opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
-            opts.setIntraOpNumThreads(intraOp);
-            opts.setInterOpNumThreads(intraOp);
             opts.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL);
-
         } catch (OrtException e) {
             throw new RuntimeException(e);
         }
@@ -409,19 +390,12 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
             }
 
             BufferedImage resized = resizeDirect(rgb, newW, newH);
-
+            // pad-or-center-crop：比 crop 小的尺度 pad 黑边到 inputSize；其余物理 crop（避免子图越界）
             BufferedImage tensorInput;
             if (resized.getWidth() < inputSize || resized.getHeight() < inputSize) {
-                tensorInput = new BufferedImage(inputSize, inputSize, BufferedImage.TYPE_INT_RGB);
-                Graphics2D g = tensorInput.createGraphics();
-                g.setColor(Color.BLACK);
-                g.fillRect(0, 0, inputSize, inputSize);
-                int offX = (inputSize - resized.getWidth()) / 2;
-                int offY = (inputSize - resized.getHeight()) / 2;
-                g.drawImage(resized, offX, offY, null);
-                g.dispose();
+                tensorInput = ImagePreprocessor.padToSize(resized, inputSize);
             } else {
-                tensorInput = centerCrop(resized, inputSize, inputSize);
+                tensorInput = ImagePreprocessor.centerCropPhysical(resized, inputSize);
             }
 
             try {
@@ -477,24 +451,12 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
             }
 
             BufferedImage resized = resizeDirect(rgb, newW, newH);
-
-            BufferedImage tensorInput;
+            // pad-or-center-crop：比 crop 小的尺度 pad 黑边到 inputSize；其余物理 crop
             if (resized.getWidth() < inputSize || resized.getHeight() < inputSize) {
-                tensorInput = new BufferedImage(inputSize, inputSize, BufferedImage.TYPE_INT_RGB);
-                Graphics2D g = tensorInput.createGraphics();
-                try {
-                    g.setColor(Color.BLACK);
-                    g.fillRect(0, 0, inputSize, inputSize);
-                    int offX = (inputSize - resized.getWidth()) / 2;
-                    int offY = (inputSize - resized.getHeight()) / 2;
-                    g.drawImage(resized, offX, offY, null);
-                } finally {
-                    g.dispose();
-                }
+                tensorInputs[si] = ImagePreprocessor.padToSize(resized, inputSize);
             } else {
-                tensorInput = centerCrop(resized, inputSize, inputSize);
+                tensorInputs[si] = ImagePreprocessor.centerCropPhysical(resized, inputSize);
             }
-            tensorInputs[si] = tensorInput;
         }
 
         // 2) 提交到 ForkJoinPool.commonPool：每个任务自己借一个 session，跑一个尺度
@@ -598,7 +560,8 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                 newW = (int) Math.round((float) w * inputSize / h);
             }
             BufferedImage resized = resizeDirect(rgb, newW, newH);
-            BufferedImage cropped = centerCrop(resized, inputSize, inputSize);
+            // 极小图兜底：此处 resized 一定是 ≥ inputSize（短边缩到 inputSize 后另一边只会更大），走物理 crop 分支
+            BufferedImage cropped = ImagePreprocessor.centerCropPhysical(resized, inputSize);
             float[][][][] chw = preprocess(cropped);
             OrtSession session = borrowSession();
             try (OnnxTensor tensor = OnnxTensor.createTensor(env, chw)) {
@@ -664,46 +627,15 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         // 当前实现直接复用，无需归还
     }
 
+    /**
+     * 转 TYPE_INT_RGB。逻辑已统一到 {@link FeatureExtractorUtils#toRgb}，保留薄包装对齐 Dino 风格。
+     */
     private static BufferedImage toRgb(BufferedImage img) {
-        if (img.getType() == BufferedImage.TYPE_INT_RGB) return img;
-        BufferedImage out = new BufferedImage(img.getWidth(), img.getHeight(), BufferedImage.TYPE_INT_RGB);
-        out.createGraphics().drawImage(img, 0, 0, null);
-        out.createGraphics().dispose();
-        return out;
-    }
-
-    private static BufferedImage centerCrop(BufferedImage src, int targetW, int targetH) {
-        int w = src.getWidth(), h = src.getHeight();
-        if (w == targetW && h == targetH) return src;
-        int x = Math.max(0, (w - targetW) / 2);
-        int y = Math.max(0, (h - targetH) / 2);
-        int cropW = Math.min(targetW, w);
-        int cropH = Math.min(targetH, h);
-        // 不再用 getSubimage —— 那是父 raster 的视图，
-        // 在某些 JDK 下 WritableRaster.getPixels 调用会因 stride == parentWidth 而越界 (Index w*h out of bounds)
-        // 这里新建一张全新的 BufferedImage 并把 cropped 区域物理复制过去
-        BufferedImage out = new BufferedImage(targetW, targetH, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g = out.createGraphics();
-        try {
-            g.setColor(Color.BLACK);
-            g.fillRect(0, 0, targetW, targetH); // 黑边
-            g.drawImage(src, 0, 0, targetW, targetH, x, y, x + cropW, y + cropH, null);
-        } finally {
-            g.dispose();
-        }
-        return out;
+        return FeatureExtractorUtils.toRgb(img);
     }
 
     private static BufferedImage flipHorizontal(BufferedImage src) {
-        int w = src.getWidth(), h = src.getHeight();
-        BufferedImage out = new BufferedImage(w, h, src.getType());
-        Graphics2D g = out.createGraphics();
-        try {
-            g.drawImage(src, w, 0, -w, h, null);
-        } finally {
-            g.dispose();
-        }
-        return out;
+        return ImagePreprocessor.flipHorizontal(src);
     }
 
     /**
@@ -723,7 +655,13 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         final int SCAN_W = 128;
         final int SCAN_H = Math.max(1, SCAN_W * H / W);
         BufferedImage probe = resizeDirect(src, SCAN_W, SCAN_H);
-        int[] pixels = new int[SCAN_W * SCAN_H];
+        int probeSize = SCAN_W * SCAN_H;
+        // 复用 ThreadLocal pixel buffer：避免每张图 new int[16384]，批量入库场景下省一次小对象分配
+        int[] pixels = PIXEL_BUFFER_HOLDER.get();
+        if (pixels == null || pixels.length < probeSize) {
+            pixels = new int[Math.max(probeSize, 8192)];
+            PIXEL_BUFFER_HOLDER.set(pixels);
+        }
         probe.getRGB(0, 0, SCAN_W, SCAN_H, pixels, 0, SCAN_W);
         int TH = 235;  // 灰度阈值，超过视为白
         int minX = SCAN_W, minY = SCAN_H, maxX = -1, maxY = -1;
@@ -778,8 +716,8 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
         var g = out.createGraphics();
         try {
-            g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
-                    java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                    RenderingHints.VALUE_INTERPOLATION_BILINEAR);
             g.drawImage(src, 0, 0, w, h, null);
         } finally {
             g.dispose();
@@ -832,11 +770,10 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         // 1. 优先按名字匹配
         for (String name : preferredNames) {
             try {
-                java.util.Optional<OnnxValue> opt = result.get(name);
+                Optional<OnnxValue> opt = result.get(name);
                 if (opt.isPresent() && opt.get() instanceof OnnxTensor t) {
                     float[] got = extractFirstRow(t.getValue());
                     if (got != null && got.length == target) {
-                        log.info("[SigLIP 推理] 按名字匹配输出头 {} dim={}", name, got.length);
                         return got;
                     }
                 }
@@ -904,15 +841,12 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
     private void probeHeads(OrtSession session) {
         try {
             log.info("[SigLIP 头探测] 启动期探测所有输出头 ...");
-            float[][][][] dummy = new float[1][3][inputSize][inputSize];
-            for (int c = 0; c < 3; c++) {
-                for (int y = 0; y < inputSize; y++) {
-                    for (int x = 0; x < inputSize; x++) {
-                        dummy[0][c][y][x] = (0.5f - MEAN[c]) / STD[c];
-                    }
-                }
-            }
-            try (OnnxTensor tensor = OnnxTensor.createTensor(env, dummy)) {
+            // 扁平化 float[] + Arrays.fill 已统一到 utils
+            int plane = inputSize * inputSize;
+            float[] dummy = new float[3 * plane];
+            FeatureExtractorUtils.fillDummyCenter(dummy, inputSize, MEAN, STD);
+            try (OnnxTensor tensor = OnnxTensor.createTensor(env, java.nio.FloatBuffer.wrap(dummy),
+                    new long[]{1, 3, inputSize, inputSize})) {
                 Map<String, OnnxTensor> inputs = Collections.singletonMap("pixel_values", tensor);
                 try (OrtSession.Result result = session.run(inputs)) {
                     int configured = embeddingProps.getSiglip().getFeatureDim();
@@ -922,17 +856,7 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
                         Map.Entry<String, OnnxValue> e = it.next();
                         OnnxValue ov = e.getValue();
                         if (!(ov instanceof OnnxTensor ot)) continue;
-                        Object val = ot.getValue();
-                        int dim = -1;
-                        if (val instanceof float[] fa) dim = fa.length;
-                        else if (val instanceof float[][] a) dim = a.length > 0 ? a[0].length : -1;
-                        else if (val instanceof float[][][] a3)
-                            dim = a3.length > 0 && a3[0].length > 0 ? a3[0][0].length : -1;
-                        else if (val instanceof List<?> l && !l.isEmpty()) {
-                            Object row = l.get(0);
-                            if (row instanceof float[] fr) dim = fr.length;
-                            else if (row instanceof Number) dim = l.size();
-                        }
+                        int dim = FeatureExtractorUtils.inferDimFromOnnxValue(ot.getValue());
                         log.info("[SigLIP 头探测]   {}  shape={}  dim={}", e.getKey(), Arrays.toString(ot.getInfo().getShape()), dim);
                         if (dim == configured) {
                             matched = dim;
@@ -955,14 +879,11 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         }
     }
 
+    /**
+     * L2 归一化。逻辑已统一到 {@link FeatureExtractorUtils#l2Normalize}，保留薄包装对齐 Dino 风格。
+     */
     private static float[] l2Normalize(float[] v) {
-        float sum = 0;
-        for (float f : v) sum += f * f;
-        float norm = (float) Math.sqrt(sum);
-        if (norm == 0) return v;
-        float[] out = new float[v.length];
-        for (int i = 0; i < v.length; i++) out[i] = v[i] / norm;
-        return out;
+        return FeatureExtractorUtils.l2Normalize(v);
     }
 
     @Override

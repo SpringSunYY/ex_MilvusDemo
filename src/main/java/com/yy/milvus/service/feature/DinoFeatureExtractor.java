@@ -13,6 +13,7 @@ import javax.imageio.ImageIO;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -87,7 +88,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
             ThreadLocal.withInitial(() -> new int[448 * 448]);
 
     // ============ 诊断用采样计数器（临时：批量入库定位瓶颈，跑完后可删除）============
-    private final java.util.concurrent.atomic.AtomicInteger diagSample = new java.util.concurrent.atomic.AtomicInteger(0);
+    private final AtomicInteger diagSample = new java.util.concurrent.atomic.AtomicInteger(0);
     // [诊断] 采样：每 10 张采 1 张 + 最后 1 张。这样 32 张跑出 4 张详细分解。
     private static final int DIAG_EVERY = 10;
 
@@ -95,6 +96,11 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     private static volatile boolean initialized = false;
     private static final AtomicInteger INSTANCE_COUNT = new AtomicInteger(0);
     private final int instanceId = INSTANCE_COUNT.incrementAndGet();
+
+    // 每线程一个复用 HashMap，避免每张图 new singletonMap(Map.Entry)。
+    // 和 Clip/SigLIP 一样 —— 在 hot path 上做一次"0.5s 节省"，每张图累计调 N 次。
+    private static final ThreadLocal<HashMap<String, OnnxTensor>> HASHMAP_HOLDER =
+            ThreadLocal.withInitial(HashMap::new);
 
     private OrtEnvironment env;
     private Path modelPath;
@@ -148,15 +154,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                 long w0 = System.currentTimeMillis();
                 // 使用 FloatBuffer 减少 GC 压力
                 float[] dummy = new float[3 * warmupSize * warmupSize];
-                float invStd0 = 1f / STD[0], invStd1 = 1f / STD[1], invStd2 = 1f / STD[2];
-                float negMean0 = -MEAN[0], negMean1 = -MEAN[1], negMean2 = -MEAN[2];
-                float val = (0.5f - MEAN[0]) / STD[0]; // 用 R 通道均值作为示例值
-                int total = warmupSize * warmupSize;
-                Arrays.fill(dummy, 0, total, val);
-                val = (0.5f - MEAN[1]) / STD[1];
-                Arrays.fill(dummy, total, total * 2, val);
-                val = (0.5f - MEAN[2]) / STD[2];
-                Arrays.fill(dummy, total * 2, total * 3, val);
+                FeatureExtractorUtils.fillDummyCenter(dummy, warmupSize, MEAN, STD);
                 try (OnnxTensor tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(dummy), new long[]{1, 3, warmupSize, warmupSize})) {
                     Map<String, OnnxTensor> inputs = Collections.singletonMap("pixel_values", tensor);
                     try (OrtSession.Result result = s.run(inputs)) {
@@ -192,16 +190,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     }
 
     private static int[] parseScales(List<Integer> list) {
-        if (list == null || list.isEmpty()) {
-            return new int[]{DEFAULT_SHORT_EDGE};
-        }
-        int[] result = new int[list.size()];
-        for (int i = 0; i < list.size(); i++) {
-            int v = list.get(i);
-            if (v < 32) throw new IllegalArgumentException("[DINO] scales 最小值为 32，当前: " + v);
-            result[i] = v;
-        }
-        return result;
+        return FeatureExtractorUtils.parseScales(list, DEFAULT_SHORT_EDGE, "DINO", 32);
     }
 
     private OrtSession borrowSession() throws OrtException {
@@ -253,35 +242,12 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     }
 
     private OrtSession.SessionOptions buildOpts(int sessionPoolSize) {
-        OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
         EmbeddingProperties.DinoProperties dino = embeddingProps.getDino();
-        int intraOp;
-        int cpuCores = Runtime.getRuntime().availableProcessors();
-        if (embeddingProps.isBatchMode()) {
-            // 批量入库模式：IntraOp=1，让 session 走单线程、不抢 CPU；
-            // N 张图并发时整体 CPU 占用可控，每个 session 排队等待本身不会变慢。
-            intraOp = 1;
-            log.info("[DINO 启动] batch-mode=true → IntraOp=1（批量友好，避免抢 CPU）");
-        } else {
-            // 单图搜图模式：让 session 内部多线程榨干 CPU。
-            // 关键：不能超过"session 池同时全借出时的总线程数 ≤ CPU 物理核数"。
-            // 否则上下文切换和锁竞争反而拖慢每张图。
-            int idealIntra = Math.max(1, cpuCores / Math.max(1, sessionPoolSize));
-            // 还要兼容"pool < CPU" 的情况（少数高性能场景，每个 session 多核）
-            // 可以使用多个线程，因为只是查询一张图
-            intraOp = Math.max(dino.getScales().size() * 2, idealIntra);
-            log.info("[DINO 启动] batch-mode=false → IntraOp={}（cpuCores={}，pool={}，",
-                    intraOp, cpuCores, sessionPoolSize);
-        }
-        try {
-            opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
-            opts.setIntraOpNumThreads(intraOp);
-            opts.setInterOpNumThreads(intraOp);  // 显式设 1：DINOv2 forward 是严格顺序的 transformer 链
-            // InterOp>1 在 ViT 上收益 < 2%，但线程切换成本反而增加。
-        } catch (OrtException e) {
-            throw new RuntimeException(e);
-        }
-        return opts;
+        // 通用部分（intraOp 计算 + OptLevel + Inter/Intra 线程数）已统一到 utils。
+        // 此处没有 Dino-specific 的额外 ONNX 选项。
+        return FeatureExtractorUtils.buildOrtSessionOptions(
+                log, "DINO", embeddingProps.isBatchMode(),
+                dino.getScales().size(), sessionPoolSize);
     }
 
     private void ensureModelFile(Path p, String tower) throws IOException {
@@ -297,29 +263,26 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     }
 
     private Path resolveModelPath(String configPath, String tower) {
-        if (configPath == null || configPath.isEmpty()) {
-            throw new IllegalArgumentException("[DINO] 模型路径未配置");
-        }
-        Path p = Paths.get(configPath);
-        if (p.isAbsolute() && Files.exists(p)) {
+        Path p = FeatureExtractorUtils.resolveModelPath(configPath, tower, "DINO", getClass());
+        // 走公共解析后，按原行为打日志（"绝对路径 / classpath / 工作目录" 三种来源分别提示）
+        Path original = Paths.get(configPath);
+        if (original.isAbsolute() && Files.exists(original)) {
             log.info("[DINO] {}模型使用绝对路径: {}", tower, p);
-            return p;
-        }
-        try {
-            String normalized = configPath.replace('\\', '/');
-            var url = getClass().getClassLoader().getResource(normalized);
-            if (url != null) {
-                Path cp = Paths.get(url.toURI());
-                log.info("[DINO] {}模型使用 classpath: {}", tower, cp);
-                return cp;
+        } else {
+            try {
+                String normalized = configPath.replace('\\', '/');
+                var url = getClass().getClassLoader().getResource(normalized);
+                if (url != null && p.equals(Paths.get(url.toURI()))) {
+                    log.info("[DINO] {}模型使用 classpath: {}", tower, p);
+                    return p;
+                }
+            } catch (Exception ignored) {
             }
-        } catch (Exception ignored) {
+            if (!original.isAbsolute()) {
+                log.warn("[DINO] {}模型使用工作目录相对路径: {}", tower, p);
+            }
         }
-        if (Files.exists(p)) {
-            log.warn("[DINO] {}模型使用工作目录相对路径: {}", tower, p.toAbsolutePath());
-            return p.toAbsolutePath();
-        }
-        return p.isAbsolute() ? p : p.toAbsolutePath();
+        return p;
     }
 
     @PreDestroy
@@ -384,7 +347,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     @Override
     public float[] extractFeature(byte[] imageBytes, ExecutorService exec) throws IOException {
         return extractFeatureFromBufferedImage(
-                ImageIO.read(new java.io.ByteArrayInputStream(imageBytes)), exec);
+                ImageIO.read(new ByteArrayInputStream(imageBytes)), exec);
     }
 
 
@@ -800,7 +763,8 @@ public class DinoFeatureExtractor implements FeatureExtractor {
             // 使用 (offset, length) 形式限制读取范围，避免 ThreadLocal buffer 过大导致 shape 不匹配
             int chwLen = 3 * size * size;
             try (OnnxTensor tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(chw, 0, chwLen), new long[]{1, 3, size, size})) {
-                Map<String, OnnxTensor> inputs = Collections.singletonMap("pixel_values", tensor);
+                java.util.HashMap<String, OnnxTensor> inputs = HASHMAP_HOLDER.get();
+                inputs.put("pixel_values", tensor);
                 try (OrtSession.Result result = session.run(inputs)) {
                     long runNs = System.nanoTime() - t0;
                     recordPerf(prepNs, runNs);
@@ -933,15 +897,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     }
 
     private static BufferedImage toRgb(BufferedImage img) {
-        if (img.getType() == BufferedImage.TYPE_INT_RGB) return img;
-        BufferedImage out = new BufferedImage(img.getWidth(), img.getHeight(), BufferedImage.TYPE_INT_RGB);
-        Graphics2D g = out.createGraphics();
-        try {
-            g.drawImage(img, 0, 0, null);
-        } finally {
-            g.dispose();
-        }
-        return out;
+        return FeatureExtractorUtils.toRgb(img);
     }
 
     private BufferedImage centerCrop(BufferedImage src, int targetW, int targetH) {
@@ -956,34 +912,13 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         // 如果 src 任意一边 < target，getSubimage 出来的子图不是 targetW × targetH，
         // 后续 toNchwFloat 读取时会越界。这里走 pad 黑边兜底，输出严格 targetW × targetH。
         if (cw < targetW || ch < targetH) {
-            BufferedImage padded = new BufferedImage(targetW, targetH, BufferedImage.TYPE_INT_RGB);
-            Graphics2D g = padded.createGraphics();
-            try {
-                g.setColor(Color.BLACK);
-                g.fillRect(0, 0, targetW, targetH);
-                g.drawImage(src, x, y, null);
-            } finally {
-                g.dispose();
-            }
-            return padded;
+            return ImagePreprocessor.padToSize(src, Math.max(targetW, targetH));
         }
         return src.getSubimage(x, y, cw, ch);
     }
 
     private static BufferedImage flipHorizontal(BufferedImage src) {
-        int w = src.getWidth();
-        int h = src.getHeight();
-        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
-        int[] srcPx = ((DataBufferInt) src.getRaster().getDataBuffer()).getData();
-        int[] dstPx = ((DataBufferInt) out.getRaster().getDataBuffer()).getData();
-        for (int y = 0; y < h; y++) {
-            int row = y * w;
-            int srcEnd = row + w - 1;
-            for (int x = 0; x < w; x++) {
-                dstPx[row + x] = srcPx[srcEnd - x];
-            }
-        }
-        return out;
+        return ImagePreprocessor.flipHorizontal(src);
     }
 
     /**
@@ -1062,10 +997,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
             log.info("[DINO 头探测] 启动期探测所有输出头 ...");
             // 使用 FloatBuffer 减少 GC 压力
             float[] dummy = new float[3 * size * size];
-            int total = size * size;
-            Arrays.fill(dummy, 0, total, (0.5f - MEAN[0]) / STD[0]);
-            Arrays.fill(dummy, total, total * 2, (0.5f - MEAN[1]) / STD[1]);
-            Arrays.fill(dummy, total * 2, total * 3, (0.5f - MEAN[2]) / STD[2]);
+            FeatureExtractorUtils.fillDummyCenter(dummy, size, MEAN, STD);
             try (OnnxTensor tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(dummy), new long[]{1, 3, size, size})) {
                 Map<String, OnnxTensor> inputs = Collections.singletonMap("pixel_values", tensor);
                 try (OrtSession.Result result = session.run(inputs)) {
@@ -1075,26 +1007,8 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                         if (!(ov instanceof OnnxTensor ot)) continue;
                         long[] shape = ot.getInfo().getShape();
                         Object onnxVal = ot.getValue();
-                        int dim = -1;
-                        String type = "?";
-                        if (onnxVal instanceof float[][][] a3) {
-                            type = "float[][][]";
-                            dim = (a3.length > 0 && a3[0].length > 0) ? a3[0][0].length : -1;
-                        } else if (onnxVal instanceof float[][] a) {
-                            type = "float[][]";
-                            dim = a.length > 0 ? a[0].length : -1;
-                        } else if (onnxVal instanceof List<?> l) {
-                            type = "List";
-                            if (!l.isEmpty()) {
-                                Object row = l.getFirst();
-                                if (row instanceof float[] fr) dim = fr.length;
-                                else if (row instanceof Number) dim = l.size();
-                                else if (row instanceof List<?>) dim = ((List<?>) row).size();
-                            }
-                        } else if (onnxVal instanceof Object[] a) {
-                            type = "Object[]";
-                            if (a.length > 0 && a[0] instanceof float[] fr) dim = fr.length;
-                        }
+                        int dim = FeatureExtractorUtils.inferDimFromOnnxValue(onnxVal);
+                        String type = FeatureExtractorUtils.onnxValueTypeName(onnxVal);
                         log.info("[DINO 头探测]   {}  shape={}  type={}  dim={}", e.getKey(), Arrays.toString(shape), type, dim);
                         if (dim > maxDim) maxDim = dim;
                     }
@@ -1124,14 +1038,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     }
 
     private static float[] l2Normalize(float[] v) {
-        // 用 double 累加 + 一次 sqrt，避免 float 累加误差；原地归一化省一次 new float[]
-        double sum = 0;
-        for (float f : v) sum += (double) f * f;
-        double norm = Math.sqrt(sum);
-        if (norm == 0) return v;
-        float inv = (float) (1.0 / norm);
-        for (int i = 0; i < v.length; i++) v[i] *= inv;
-        return v;
+        return FeatureExtractorUtils.l2Normalize(v);
     }
 
     @Override

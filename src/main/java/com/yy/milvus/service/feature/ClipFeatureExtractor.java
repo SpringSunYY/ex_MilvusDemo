@@ -57,6 +57,12 @@ public class ClipFeatureExtractor implements FeatureExtractor {
      */
     private static final Deque<OrtSession> VISION_POOL = new ArrayDeque<>();
     /**
+     * 每线程复用 session.run() 输入 Map，避免每张图重新分配 Collections.singletonMap(...)。
+     * 不与其他 extractor 共享：各 extractor 独立 static，互不干扰。
+     */
+    private static final ThreadLocal<java.util.HashMap<String, OnnxTensor>> HASHMAP_HOLDER =
+            ThreadLocal.withInitial(java.util.HashMap::new);
+    /**
      * 记录当前 Bean 是否已完成初始化（防止被新实例覆盖后重复初始化）
      */
     private static volatile boolean initialized = false;
@@ -156,25 +162,23 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     }
 
     /**
-     * 解析多尺度列表，如 [224, 256] → int[]，同时校验最小值
+     * 解析多尺度列表，如 [224, 256] → int[]。逻辑与 Dino/SigLIP 同源，已统一到
+     * {@link FeatureExtractorUtils#parseScales}。
      */
     private static int[] parseScales(List<Integer> list) {
-        if (list == null || list.isEmpty()) {
-            return new int[]{224};
-        }
-        int[] result = new int[list.size()];
-        for (int i = 0; i < list.size(); i++) {
-            int v = list.get(i);
-            if (v < 32) throw new IllegalArgumentException("[CLIP] scales 最小值为 32，当前: " + v);
-            result[i] = v;
-        }
-        return result;
+        return FeatureExtractorUtils.parseScales(list, 224, "CLIP", 32);
     }
 
     /**
      * 借一个视觉 session；池空时阻塞等待归还，永不返回 null。
+     * <p>
+     * 日志策略：高并发下"每张图借/还都打"会刷屏到影响磁盘 IO（feature-threads=16 时，
+     * 一张图的两行 INFO 加起来就是 32 行/张）。只在真正等了 (>1ms) 才打借出等待时间，
+     * 归还静默。
      */
     private OrtSession borrowVisionSession() throws OrtException {
+        long t0 = System.nanoTime();
+        OrtSession s;
         synchronized (VISION_POOL) {
             int waitCount = 0;
             while (VISION_POOL.isEmpty()) {
@@ -189,53 +193,29 @@ public class ClipFeatureExtractor implements FeatureExtractor {
                     throw new OrtException("[CLIP] 等待 vision session 被中断");
                 }
             }
-            OrtSession s = VISION_POOL.pollFirst();
-            log.info("[CLIP 借] pool {} -> {}", VISION_POOL.size() + 1, VISION_POOL.size());
-            return s;
+            s = VISION_POOL.pollFirst();
         }
+        long waitNs = System.nanoTime() - t0;
+        if (waitNs > 1_000_000L) {
+            log.info("[CLIP 借] 等 {}ms 后取出", waitNs / 1_000_000L);
+        }
+        return s;
     }
 
     private void returnVisionSession(OrtSession s) {
         if (s == null) return;
         synchronized (VISION_POOL) {
-            int before = VISION_POOL.size();
             VISION_POOL.addLast(s);
-            int after = VISION_POOL.size();
-            log.info("[CLIP 还] pool {} -> {}", before, after);
             VISION_POOL.notify();
         }
     }
 
     private OrtSession.SessionOptions buildOpts(int sessionPoolSize) {
-        OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
         EmbeddingProperties.ClipProperties clip = embeddingProps.getClip();
-        int intraOp;
-        int cpuCores = Runtime.getRuntime().availableProcessors();
-        if (embeddingProps.isBatchMode()) {
-            // 批量入库模式：IntraOp=1，让 session 走单线程、不抢 CPU；
-            // N 张图并发时整体 CPU 占用可控，每个 session 排队等待本身不会变慢。
-            intraOp = 1;
-            log.info("[DINO 启动] batch-mode=true → IntraOp=1（批量友好，避免抢 CPU）");
-        } else {
-            // 单图搜图模式：让 session 内部多线程榨干 CPU。
-            // 关键：不能超过"session 池同时全借出时的总线程数 ≤ CPU 物理核数"。
-            // 否则上下文切换和锁竞争反而拖慢每张图。
-            int idealIntra = Math.max(1, cpuCores / Math.max(1, sessionPoolSize));
-            // 还要兼容"pool < CPU" 的情况（少数高性能场景，每个 session 多核）
-            // 可以使用多个线程，因为只是查询一张图
-            intraOp = Math.max(clip.getScales().size() * 2, idealIntra);
-            log.info("[CLIP 启动] batch-mode=false → IntraOp={}（cpuCores={}，pool={}，)",
-                    intraOp, cpuCores, sessionPoolSize);
-        }
-        try {
-            opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
-            opts.setIntraOpNumThreads(intraOp);
-            opts.setInterOpNumThreads(intraOp);  // 显式设 1：DINOv2 forward 是严格顺序的 transformer 链
-            // InterOp>1 在 ViT 上收益 < 2%，但线程切换成本反而增加。
-        } catch (OrtException e) {
-            throw new RuntimeException(e);
-        }
-        return opts;
+        // 通用部分已统一到 utils。CLIP 当前没有自己的额外 ONNX 选项。
+        return FeatureExtractorUtils.buildOrtSessionOptions(
+                log, "CLIP", embeddingProps.isBatchMode(),
+                clip.getScales().size(), sessionPoolSize);
     }
 
     private void ensureModelFile(Path p, String tower) throws IOException {
@@ -477,20 +457,12 @@ public class ClipFeatureExtractor implements FeatureExtractor {
                 newW = (int) Math.round((float) w * targetShort / h);
             }
             BufferedImage resized = resizeDirect(rgb, newW, newH);
-
-            // 比 crop 小的尺度：pad 黑边到 224×224 再进 ONNX
+            // 比 crop 小的尺度 pad 黑边到 224×224；其余 center crop（视图）
             BufferedImage tensorInput;
             if (resized.getWidth() < IMG_SIZE || resized.getHeight() < IMG_SIZE) {
-                tensorInput = new BufferedImage(IMG_SIZE, IMG_SIZE, BufferedImage.TYPE_INT_RGB);
-                Graphics2D g = tensorInput.createGraphics();
-                g.setColor(Color.BLACK);
-                g.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
-                int offX = (IMG_SIZE - resized.getWidth()) / 2;
-                int offY = (IMG_SIZE - resized.getHeight()) / 2;
-                g.drawImage(resized, offX, offY, null);
-                g.dispose();
+                tensorInput = ImagePreprocessor.padToSize(resized, IMG_SIZE);
             } else {
-                tensorInput = centerCrop(resized, IMG_SIZE, IMG_SIZE);
+                tensorInput = ImagePreprocessor.centerCropView(resized, IMG_SIZE);
             }
 
             try {
@@ -549,25 +521,12 @@ public class ClipFeatureExtractor implements FeatureExtractor {
                 newW = (int) Math.round((float) w * targetShort / h);
             }
             BufferedImage resized = resizeDirect(rgb, newW, newH);
-
-            // 比 crop 小的尺度：pad 黑边到 224×224 再进 ONNX
-            BufferedImage tensorInput;
+            // 比 crop 小的尺度 pad 黑边到 224×224；其余 center crop（视图）
             if (resized.getWidth() < IMG_SIZE || resized.getHeight() < IMG_SIZE) {
-                tensorInput = new BufferedImage(IMG_SIZE, IMG_SIZE, BufferedImage.TYPE_INT_RGB);
-                Graphics2D g = tensorInput.createGraphics();
-                try {
-                    g.setColor(Color.BLACK);
-                    g.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
-                    int offX = (IMG_SIZE - resized.getWidth()) / 2;
-                    int offY = (IMG_SIZE - resized.getHeight()) / 2;
-                    g.drawImage(resized, offX, offY, null);
-                } finally {
-                    g.dispose();
-                }
+                tensorInputs[si] = ImagePreprocessor.padToSize(resized, IMG_SIZE);
             } else {
-                tensorInput = centerCrop(resized, IMG_SIZE, IMG_SIZE);
+                tensorInputs[si] = ImagePreprocessor.centerCropView(resized, IMG_SIZE);
             }
-            tensorInputs[si] = tensorInput;
         }
 
         // 2) 提交到 ForkJoinPool.commonPool：每个任务自己借一个 session，跑一个尺度
@@ -630,17 +589,25 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     }
 
     /**
-     * 用 session 跑一次推理，内部复用 reuse 缓冲区避免反复分配
+     * 用 session 跑一次推理，内部复用 reuse 缓冲区避免反复分配。
+     * <p>
+     * 输入 Map 也走 ThreadLocal 复用，避免每张图重建 singletonMap 的 Map.Entry 对象。
      */
     private float[] runInference(BufferedImage tensorInput, float[][][][] reuse) throws OrtException {
         OrtSession session = borrowVisionSession();
         try {
             toChwReuse(tensorInput, reuse);
-            try (OnnxTensor tensor = OnnxTensor.createTensor(env, reuse)) {
-                Map<String, OnnxTensor> inputs = Collections.singletonMap("pixel_values", tensor);
+            OnnxTensor tensor = OnnxTensor.createTensor(env, reuse);
+            try {
+                java.util.HashMap<String, OnnxTensor> inputs = HASHMAP_HOLDER.get();
+                inputs.put("pixel_values", tensor);
                 try (OrtSession.Result result = session.run(inputs)) {
                     return extractFirstRow(result.get(0).getValue());
+                } finally {
+                    inputs.clear(); // 去掉对 OnnxTensor 的引用，等 OnnxTensor close 后再释放
                 }
+            } finally {
+                tensor.close();
             }
         } finally {
             returnVisionSession(session);
@@ -648,18 +615,26 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     }
 
     /**
-     * 极小图兜底：直接预处理成 224x224 单尺度推理
+     * 极小图兜底：直接预处理成 224x224 单尺度推理。
+     * <p>
+     * 同样使用 ThreadLocal HashMap 复用，跑前预先清空避免泄漏 OnnxTensor 引用。
      */
     private float[] runSingleScaleFallback(BufferedImage image) throws IOException {
         try {
             float[][][][] chw = preprocess(image);
             OrtSession session = borrowVisionSession();
             try {
-                try (OnnxTensor tensor = OnnxTensor.createTensor(env, chw)) {
-                    Map<String, OnnxTensor> inputs = Collections.singletonMap("pixel_values", tensor);
+                OnnxTensor tensor = OnnxTensor.createTensor(env, chw);
+                try {
+                    java.util.HashMap<String, OnnxTensor> inputs = HASHMAP_HOLDER.get();
+                    inputs.put("pixel_values", tensor);
                     try (OrtSession.Result result = session.run(inputs)) {
                         return extractFirstRow(result.get(0).getValue());
+                    } finally {
+                        inputs.clear();
                     }
+                } finally {
+                    tensor.close();
                 }
             } finally {
                 returnVisionSession(session);
@@ -670,19 +645,10 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     }
 
     /**
-     * 水平翻转：创建一张新的 BufferedImage，像素左右镜像
+     * 水平翻转：逻辑已统一到 {@link ImagePreprocessor#flipHorizontal}，保留薄包装对齐 Dino 风格。
      */
     private static BufferedImage flipHorizontal(BufferedImage src) {
-        int w = src.getWidth();
-        int h = src.getHeight();
-        BufferedImage out = new BufferedImage(w, h, src.getType());
-        Graphics2D g = out.createGraphics();
-        try {
-            g.drawImage(src, w, 0, -w, h, null);
-        } finally {
-            g.dispose();
-        }
-        return out;
+        return ImagePreprocessor.flipHorizontal(src);
     }
 
     /**
@@ -759,8 +725,8 @@ public class ClipFeatureExtractor implements FeatureExtractor {
         }
         BufferedImage resized = resize(rgb, newW, newH, java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
 
-        // CenterCrop 到 224x224
-        BufferedImage cropped = centerCrop(resized, IMG_SIZE, IMG_SIZE);
+        // CenterCrop 到 224x224（CLIP 用 getSubimage 视图风格，与多尺度循环保持一致）
+        BufferedImage cropped = ImagePreprocessor.centerCropView(resized, IMG_SIZE);
 
         // 转 float + 归一化（一次性整图读像素，避免逐点 getRGB）
         int cw = cropped.getWidth();
@@ -783,27 +749,11 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     }
 
     /**
-     * CenterCrop：居中裁剪，不够大则先 resize
+     * 转 TYPE_INT_RGB。逻辑已统一到 {@link FeatureExtractorUtils#toRgb}，这里只包一层签名
+     * 保留 extractor 内部静态方法的访问形式。
      */
-    private BufferedImage centerCrop(BufferedImage src, int targetW, int targetH) {
-        int w = src.getWidth();
-        int h = src.getHeight();
-        if (w == targetW && h == targetH) {
-            return src;
-        }
-        int x = Math.max(0, (w - targetW) / 2);
-        int y = Math.max(0, (h - targetH) / 2);
-        int cw = Math.min(targetW, w);
-        int ch = Math.min(targetH, h);
-        return src.getSubimage(x, y, cw, ch);
-    }
-
     private static BufferedImage toRgb(BufferedImage img) {
-        if (img.getType() == BufferedImage.TYPE_INT_RGB) return img;
-        BufferedImage out = new BufferedImage(img.getWidth(), img.getHeight(), BufferedImage.TYPE_INT_RGB);
-        out.createGraphics().drawImage(img, 0, 0, null);
-        out.createGraphics().dispose();
-        return out;
+        return FeatureExtractorUtils.toRgb(img);
     }
 
     /**
@@ -894,18 +844,12 @@ public class ClipFeatureExtractor implements FeatureExtractor {
     private void probeVisionHeads(OrtSession session) {
         try {
             log.info("[CLIP 头探测] 启动期探测视觉塔所有输出头 ...");
-            // 1) 准备 0.5 噪声输入 [1][3][224][224]
-            float[][][][] dummy = new float[1][3][IMG_SIZE][IMG_SIZE];
-            for (int c = 0; c < 3; c++) {
-                for (int y = 0; y < IMG_SIZE; y++) {
-                    for (int x = 0; x < IMG_SIZE; x++) {
-                        // 0.5 归一化后 ≈ (0.5 - mean) / std
-                        dummy[0][c][y][x] = (0.5f - MEAN[c]) / STD[c];
-                    }
-                }
-            }
-            // 2) 跑
-            try (OnnxTensor tensor = OnnxTensor.createTensor(env, dummy)) {
+            // 1) 准备 0.5 噪声输入：扁平化 float[] + Arrays.fill 已统一到 utils
+            int plane = IMG_SIZE * IMG_SIZE;
+            float[] dummy = new float[3 * plane];
+            FeatureExtractorUtils.fillDummyCenter(dummy, IMG_SIZE, MEAN, STD);
+            try (OnnxTensor tensor = OnnxTensor.createTensor(env, java.nio.FloatBuffer.wrap(dummy),
+                    new long[]{1, 3, IMG_SIZE, IMG_SIZE})) {
                 Map<String, OnnxTensor> inputs = Collections.singletonMap("pixel_values", tensor);
                 try (OrtSession.Result result = session.run(inputs)) {
                     // 3) 遍历所有输出头：OrtSession.Result 的 iterator() 返回 Iterator<Map.Entry<String, OnnxValue>>
@@ -913,27 +857,11 @@ public class ClipFeatureExtractor implements FeatureExtractor {
                         Map.Entry<String, OnnxValue> e = it.next();
                         String name = e.getKey();
                         OnnxValue ov = e.getValue();
-                        // 结果关闭时 OnnxValue 自动 release，这里只读不 close
                         if (!(ov instanceof OnnxTensor ot)) continue;
                         long[] shape = ot.getInfo().getShape();
                         Object val = ot.getValue();
-                        int dim = -1;
-                        String type = "?";
-                        if (val instanceof float[][] arr) {
-                            type = "float[][]";
-                            dim = arr.length > 0 ? arr[0].length : -1;
-                        } else if (val instanceof List<?> list) {
-                            type = "List";
-                            if (!list.isEmpty()) {
-                                Object row = list.get(0);
-                                if (row instanceof float[] fr) dim = fr.length;
-                                else if (row instanceof Number) dim = list.size();
-                                else if (row instanceof List<?> inner) dim = inner.size();
-                            }
-                        } else if (val instanceof Object[] arr) {
-                            type = "Object[]";
-                            if (arr.length > 0 && arr[0] instanceof float[] fr) dim = fr.length;
-                        }
+                        int dim = FeatureExtractorUtils.inferDimFromOnnxValue(val);
+                        String type = FeatureExtractorUtils.onnxValueTypeName(val);
                         log.info("[CLIP 头探测]   {}  shape={}  type={}  dim={}",
                                 name, Arrays.toString(shape), type, dim);
                     }
@@ -944,10 +872,7 @@ public class ClipFeatureExtractor implements FeatureExtractor {
                     } catch (Exception ignored) {
                     }
                     if (imgOv instanceof OnnxTensor ot) {
-                        Object v = ot.getValue();
-                        int d = (v instanceof float[][] a) ? a[0].length
-                                : (v instanceof List<?> l && !l.isEmpty() && l.get(0) instanceof float[] fr) ? fr.length
-                                  : -1;
+                        int d = FeatureExtractorUtils.inferDimFromOnnxValue(ot.getValue());
                         if (d == 512) {
                             log.info("[CLIP 头探测] ✅  找到 image_embeds[512] —— 当前代码 result.get(0) 拿到的是 [0]号输出头。"
                                     + "若 [0] = image_embeds，512 维投影后特征，OK；若 [0] = logits_per_image (1,768)，那你的代码在错读 logits！");
@@ -965,11 +890,7 @@ public class ClipFeatureExtractor implements FeatureExtractor {
                         Map.Entry<String, OnnxValue> e = it.next();
                         OnnxValue ov = e.getValue();
                         if (!(ov instanceof OnnxTensor ot2)) continue;
-                        Object val = ot2.getValue();
-                        int d = -1;
-                        if (val instanceof float[][] arr && arr.length > 0) d = arr[0].length;
-                        else if (val instanceof List<?> list && !list.isEmpty() && list.get(0) instanceof float[] fr)
-                            d = fr.length;
+                        int d = FeatureExtractorUtils.inferDimFromOnnxValue(ot2.getValue());
                         if (d > realDim) realDim = d;
                     }
                     log.info("[CLIP 头探测] yml.feature-dim = {} | 推理输出最大维度 = {}",
@@ -993,14 +914,11 @@ public class ClipFeatureExtractor implements FeatureExtractor {
         }
     }
 
+    /**
+     * L2 归一化。逻辑已统一到 {@link FeatureExtractorUtils#l2Normalize}，保留薄包装对齐 Dino 风格。
+     */
     private static float[] l2Normalize(float[] v) {
-        float sum = 0;
-        for (float f : v) sum += f * f;
-        float norm = (float) Math.sqrt(sum);
-        if (norm == 0) return v;
-        float[] out = new float[v.length];
-        for (int i = 0; i < v.length; i++) out[i] = v[i] / norm;
-        return out;
+        return FeatureExtractorUtils.l2Normalize(v);
     }
 
     @Override
