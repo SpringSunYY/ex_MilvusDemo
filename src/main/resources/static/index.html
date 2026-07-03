@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>以图搜图 · Milvus Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh; color: #333; padding: 48px;
+  }
+  .container { max-width: 1680px; margin: 0 auto; }
+  h1 { color: #fff; margin-bottom: 4px; font-size: 28px; }
+  .subtitle { color: rgba(255,255,255,0.85); margin-bottom: 20px; font-size: 14px; }
+
+  .info-bar {
+    display: flex; gap: 24px; flex-wrap: wrap;
+    padding: 12px 16px; background: rgba(255,255,255,0.95);
+    border-radius: 10px; font-size: 13px; color: #555; margin-bottom: 16px;
+  }
+  .info-bar b { color: #333; }
+  .info-bar button {
+    margin-left: auto; background: transparent; border: 1px solid #d8dce6;
+    padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; color: #667eea;
+  }
+  .info-bar button:hover { background: #f0f2ff; }
+
+  .tabs { display: flex; gap: 4px; margin-bottom: -2px; padding: 0 8px; }
+  .tab {
+    background: rgba(255,255,255,0.7); color: #555;
+    border: none; padding: 10px 22px; border-radius: 10px 10px 0 0;
+    cursor: pointer; font-size: 14px; font-weight: 500;
+    transition: all 0.15s;
+  }
+  .tab:hover { background: rgba(255,255,255,0.9); }
+  .tab.active { background: #fff; color: #667eea; font-weight: 600; }
+
+  .panel {
+    background: #fff; border-radius: 0 12px 12px 12px;
+    padding: 20px 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+    min-height: 480px;
+  }
+  .panel h2 { font-size: 16px; margin-bottom: 14px; color: #444; }
+  .panel h3 { font-size: 14px; margin: 18px 0 10px; color: #666; }
+
+  .upload-zone {
+    border: 2px dashed #c5c9d6; border-radius: 10px; padding: 32px;
+    text-align: center; cursor: pointer; transition: all 0.2s; background: #fafbff;
+  }
+  .upload-zone:hover, .upload-zone.dragging { border-color: #667eea; background: #f0f2ff; }
+  .upload-zone .icon { font-size: 40px; color: #b0b6c8; margin-bottom: 8px; }
+  .upload-zone .hint { color: #888; font-size: 13px; margin-top: 6px; }
+  .file-list { margin-top: 12px; max-height: 200px; overflow-y: auto; }
+  .file-item {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 6px 10px; background: #f6f7fb; border-radius: 6px; margin-bottom: 4px;
+    font-size: 13px;
+  }
+  .file-item .size { color: #888; font-size: 12px; }
+
+  .actions { display: flex; gap: 10px; margin-top: 16px; align-items: center; flex-wrap: wrap; }
+  .btn {
+    background: #667eea; color: #fff; border: none; padding: 10px 20px;
+    border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; transition: all 0.15s;
+  }
+  .btn:hover { background: #5568d3; }
+  .btn:disabled { background: #b0b6c8; cursor: not-allowed; }
+  .btn.secondary { background: #f0f2f7; color: #555; }
+  .btn.secondary:hover { background: #e2e6f0; }
+  .btn.danger { background: #e74c3c; }
+  .btn.danger:hover { background: #c0392b; }
+  .topk-input, .text-input, .number-input {
+    padding: 9px 12px; border: 1px solid #d8dce6; border-radius: 8px;
+    font-size: 14px;
+  }
+  .topk-input, .number-input { width: 80px; }
+  .text-input { width: 220px; }
+
+  .preview-row { display: flex; gap: 24px; flex-wrap: wrap; }
+  .preview-block { flex: 1; min-width: 280px; }
+  .preview-label { font-size: 13px; color: #888; margin-bottom: 8px; }
+  .preview-img {
+    width: 100%; max-height: 360px; min-height: 200px;
+    background: #f6f7fb; border-radius: 10px; border: 1px solid #eef0f6;
+    display: flex; align-items: center; justify-content: center; color: #b0b6c8;
+  }
+  .preview-img img { max-width: 100%; max-height: 360px; border-radius: 10px; cursor: zoom-in; }
+
+  .results-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 14px;
+  }
+  .result-card {
+    background: #fff; border-radius: 10px; overflow: hidden;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    transition: transform 0.15s; border: 1px solid #eef0f6;
+    cursor: zoom-in;
+  }
+  .result-card:hover { transform: translateY(-3px); box-shadow: 0 6px 16px rgba(0,0,0,0.12); }
+  .result-card img { width: 100%; height: 160px; object-fit: cover; display: block; background: #f6f7fb; }
+  .result-info { padding: 8px 10px; font-size: 12px; }
+  .result-score { color: #667eea; font-weight: 600; }
+  .result-id { color: #999; font-family: monospace; }
+
+  .empty { color: #aaa; text-align: center; padding: 36px; font-size: 14px; }
+
+  .toast {
+    position: fixed; top: 20px; right: 20px; padding: 12px 18px;
+    background: #333; color: #fff; border-radius: 8px; font-size: 14px;
+    opacity: 0; transition: opacity 0.2s; z-index: 1000; max-width: 360px;
+  }
+  .toast.show { opacity: 1; }
+  .toast.error { background: #e74c3c; }
+  .toast.success { background: #27ae60; }
+
+  .gallery {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 10px; max-height: 500px; overflow-y: auto; padding: 4px;
+  }
+  .gallery-item {
+    background: #f6f7fb; border-radius: 8px; overflow: hidden;
+    border: 1px solid #eef0f6; position: relative;
+    cursor: zoom-in;
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  .gallery-item:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(0,0,0,0.12); }
+  .gallery-item img { width: 100%; height: 110px; object-fit: cover; display: block; }
+  .gallery-item .gid {
+    position: absolute; bottom: 4px; left: 4px; right: 4px;
+    background: rgba(0,0,0,0.6); color: #fff; font-size: 11px;
+    padding: 2px 6px; border-radius: 4px; text-align: center;
+    font-family: monospace;
+  }
+
+  .console {
+    background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px;
+    font-family: "Cascadia Code", "Consolas", monospace; font-size: 13px;
+    min-height: 200px; max-height: 400px; overflow-y: auto; white-space: pre-wrap;
+  }
+  .console .log-line { margin-bottom: 2px; }
+  .console .log-info { color: #9cdcfe; }
+  .console .log-success { color: #4ec9b0; }
+  .console .log-error { color: #f48771; }
+  .console .log-warn { color: #dcdcaa; }
+
+  .import-section { margin-top: 24px; padding: 20px; background: #f8f9ff; border-radius: 10px; border: 1px solid #e0e4f8; }
+  .import-section h3 { color: #667eea; margin-bottom: 12px; font-size: 14px; }
+  .import-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .import-row label { font-size: 13px; color: #555; white-space: nowrap; }
+  .dir-input { padding: 8px 12px; border: 1px solid #d8dce6; border-radius: 8px; font-size: 13px; width: 380px; }
+  .batch-hint { font-size: 12px; color: #888; margin-left: 8px; }
+  .progress-bar { height: 6px; background: #e8edff; border-radius: 3px; margin-top: 10px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg, #667eea, #764ba2); border-radius: 3px; width: 0%; transition: width 0.3s; }
+  .import-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-top: 12px; }
+  .stat-card { background: #fff; border-radius: 8px; padding: 10px 14px; text-align: center; border: 1px solid #e8edff; }
+  .stat-card .num { font-size: 22px; font-weight: 700; color: #667eea; }
+  .stat-card .lbl { font-size: 11px; color: #888; margin-top: 2px; }
+  .stat-card.inserted .num { color: #27ae60; }
+  .stat-card.skipped .num { color: #f39c12; }
+  .stat-card.failed .num { color: #e74c3c; }
+
+  @media (max-width: 720px) { .preview-row { flex-direction: column; } }
+
+  /* ===== Lightbox 灯箱 ===== */
+  .lightbox {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.85);
+    display: none; align-items: center; justify-content: center;
+    z-index: 2000; padding: 24px;
+    animation: lbFadeIn 0.18s ease-out;
+  }
+  .lightbox.show { display: flex; }
+  @keyframes lbFadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .lightbox-img {
+    max-width: 95vw; max-height: 90vh;
+    border-radius: 8px; box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    background: #fff;
+  }
+  .lightbox-caption {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    color: #fff; background: rgba(0,0,0,0.55); padding: 6px 14px;
+    border-radius: 6px; font-size: 13px; max-width: 80vw;
+    text-align: center;
+  }
+  .lightbox-close {
+    position: absolute; top: 16px; right: 20px;
+    width: 40px; height: 40px; border-radius: 50%;
+    background: rgba(255,255,255,0.15); color: #fff; border: none;
+    font-size: 22px; cursor: pointer; line-height: 40px; text-align: center;
+    transition: background 0.15s;
+  }
+  .lightbox-close:hover { background: rgba(255,255,255,0.3); }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>以图搜图 · Milvus Demo</h1>
+  <p class="subtitle">基于 Milvus 向量数据库的图像检索系统</p>
+
+  <!-- 顶部集合状态栏 -->
+  <div class="info-bar" id="infoBar">
+    <span>集合: <b id="infoName">-</b></span>
+    <span>记录数: <b id="infoCount">-</b></span>
+    <span>特征维度: <b id="infoDim">-</b></span>
+    <button id="refreshInfo">🔄 刷新</button>
+  </div>
+
+  <!-- 标签栏 -->
+  <div class="tabs">
+    <button class="tab active" data-tab="index">① 索引图片</button>
+    <button class="tab" data-tab="search">② 以图搜图</button>
+    <button class="tab" data-tab="manage">③ 集合管理</button>
+    <button class="tab" data-tab="demo">④ 运行示例</button>
+  </div>
+
+  <!-- ============ 索引图片 ============ -->
+  <div class="panel" id="tab-index">
+    <h2>索引图片到 Milvus</h2>
+
+    <h3>单张入库</h3>
+    <div class="upload-zone" id="dropZoneSingle">
+      <div class="icon">📁</div>
+      <div><b>点击选择</b> 或拖拽单张图片</div>
+      <div class="hint">支持 JPG / PNG</div>
+      <input type="file" id="fileInputSingle" accept="image/*" hidden>
+    </div>
+    <div class="actions">
+      <button class="btn" id="uploadSingleBtn" disabled>📥 入库这张</button>
+      <span class="status" id="singleStatus"></span>
+    </div>
+
+    <h3>批量入库</h3>
+    <div class="upload-zone" id="dropZoneBatch">
+      <div class="icon">📂</div>
+      <div><b>点击选择</b> 或拖拽多张图片</div>
+      <div class="hint">支持多选 JPG / PNG</div>
+      <input type="file" id="fileInputBatch" accept="image/*" hidden multiple>
+    </div>
+    <div class="file-list" id="batchFileList"></div>
+    <div class="actions">
+      <button class="btn" id="uploadBatchBtn" disabled>📥 批量入库</button>
+      <button class="btn secondary" id="clearBatchBtn">清空列表</button>
+      <span class="status" id="batchStatus"></span>
+    </div>
+
+    <!-- ============ 本地目录导入 ============ -->
+    <div class="import-section" id="importSection">
+      <h3>📂 本地目录导入</h3>
+      <div class="import-row">
+        <label>目录路径：</label>
+        <input type="text" class="dir-input" id="importDirInput"
+               placeholder="例如 E:/Desktop/images 或 C:/Users/你的图片"
+               value="E:/Desktop/images">
+        <label style="margin-left:8px">递归子目录：</label>
+        <input type="checkbox" id="importRecursive" checked>
+        <span class="batch-hint">（默认跳过已入库的图片）</span>
+      </div>
+      <div class="import-row">
+        <button class="btn" id="startImportBtn">🚀 开始导入</button>
+        <span class="status" id="importStatus"></span>
+      </div>
+      <div id="importProgress" style="display:none">
+        <div class="progress-bar"><div class="progress-fill" id="importProgressFill"></div></div>
+      </div>
+      <div class="import-stats" id="importStats" style="display:none">
+        <div class="stat-card">
+          <div class="num" id="statScanned">-</div>
+          <div class="lbl">扫描到</div>
+        </div>
+        <div class="stat-card inserted">
+          <div class="num" id="statInserted">-</div>
+          <div class="lbl">新增入库</div>
+        </div>
+        <div class="stat-card skipped">
+          <div class="num" id="statSkipped">-</div>
+          <div class="lbl">已跳过</div>
+        </div>
+        <div class="stat-card failed">
+          <div class="num" id="statFailed">-</div>
+          <div class="lbl">失败</div>
+        </div>
+        <div class="stat-card">
+          <div class="num" id="statDuration">-</div>
+          <div class="lbl">耗时(秒)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 以图搜图 ============ -->
+  <div class="panel" id="tab-search" style="display:none">
+    <h2>以图搜图</h2>
+    <div class="upload-zone" id="dropZoneQuery">
+      <div class="icon">🔍</div>
+      <div><b>点击选择</b> 或拖拽查询图片</div>
+      <div class="hint">上传一张图片，系统会找最相似的 K 张</div>
+      <input type="file" id="fileInputQuery" accept="image/*" hidden>
+    </div>
+    <div class="actions">
+      <label>TopK:</label>
+      <input type="number" id="topK" class="topk-input" value="10" min="1" max="50">
+      <button class="btn" id="searchBtn" disabled>🔍 开始搜索</button>
+      <button class="btn secondary" id="clearQueryBtn">清空</button>
+      <span class="status" id="queryStatus"></span>
+    </div>
+    <h3>查询图预览</h3>
+    <div class="preview-row">
+      <div class="preview-block">
+        <div class="preview-img" id="queryPreview"><span>尚未选择图片</span></div>
+      </div>
+    </div>
+    <h3>相似图片</h3>
+    <div id="resultsArea">
+      <div class="empty">暂无结果。点击「开始搜索」开始检索。</div>
+    </div>
+  </div>
+
+  <!-- ============ 集合管理 ============ -->
+  <div class="panel" id="tab-manage" style="display:none">
+    <h2>集合管理</h2>
+    <div class="info-bar" style="margin-bottom:16px">
+      <span>集合名: <b id="mName">-</b></span>
+      <span>是否存在: <b id="mExists">-</b></span>
+      <span>记录数: <b id="mCount">-</b></span>
+    </div>
+    <div class="actions" style="margin-top:0">
+      <label>样本数:</label>
+      <input type="number" id="sampleSize" class="number-input" value="50" min="1" max="500">
+      <button class="btn secondary" id="loadSamplesBtn">📋 加载样本图片</button>
+      <button class="btn danger" id="resetBtn">⚠ 重置集合（清空）</button>
+    </div>
+    <h3>已索引图片样本</h3>
+    <div id="galleryArea">
+      <div class="empty">点击「加载样本图片」查看已入库的图</div>
+    </div>
+  </div>
+
+  <!-- ============ 运行示例 ============ -->
+  <div class="panel" id="tab-demo" style="display:none">
+    <h2>运行示例演示</h2>
+    <p style="color:#666; font-size:13px; margin-bottom:14px">
+      依次执行：重置集合 → 索引示例图 → 以图搜图 → 输出结果
+    </p>
+    <div class="actions" style="margin-top:0">
+      <button class="btn" id="runDemoBtn">▶ 一键运行示例</button>
+      <button class="btn secondary" id="clearLogBtn">清空日志</button>
+    </div>
+    <h3>执行日志</h3>
+    <div class="console" id="consoleArea">点击「一键运行示例」开始...</div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- 图片放大预览灯箱 -->
+<div class="lightbox" id="lightbox">
+  <button class="lightbox-close" id="lightboxClose" title="关闭 (Esc)">×</button>
+  <img class="lightbox-img" id="lightboxImg" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<script>
+  const API = '/api/image-search';
+
+  // ===== 通用工具 =====
+  function toast(msg, type) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (type ? ' ' + type : '');
+    setTimeout(() => t.className = 'toast', 2400);
+  }
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function setBusy(btn, busy, text) {
+    btn.disabled = busy;
+    btn.textContent = text;
+  }
+  function fmtSize(b) {
+    if (b < 1024) return b + ' B';
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+    return (b / 1024 / 1024).toFixed(2) + ' MB';
+  }
+
+  // ===== 图片放大预览（Lightbox）=====
+  const lightbox = document.getElementById('lightbox');
+  const lightboxImg = document.getElementById('lightboxImg');
+  const lightboxCaption = document.getElementById('lightboxCaption');
+  function openLightbox(src, caption) {
+    if (!src) return;
+    lightboxImg.src = src;
+    lightboxCaption.textContent = caption || '';
+    lightboxCaption.style.display = caption ? 'block' : 'none';
+    lightbox.classList.add('show');
+  }
+  function closeLightbox() {
+    lightbox.classList.remove('show');
+    lightboxImg.src = '';
+  }
+  document.getElementById('lightboxClose').onclick = closeLightbox;
+  lightbox.addEventListener('click', e => { if (e.target === lightbox) closeLightbox(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
+  // ===== Tab 切换 =====
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      document.querySelectorAll('.panel').forEach(p => p.style.display = 'none');
+      const id = 'tab-' + tab.dataset.tab;
+      document.getElementById(id).style.display = 'block';
+      if (tab.dataset.tab === 'manage') loadManageInfo();
+    });
+  });
+
+  // ===== 顶部信息栏 =====
+  async function loadInfo() {
+    try {
+      const [info, stats] = await Promise.all([
+        fetch(API + '/info').then(r => r.json()),
+        fetch(API + '/stats?sampleSize=1').then(r => r.json())
+      ]);
+      document.getElementById('infoName').textContent = info.collectionName || '-';
+      document.getElementById('infoDim').textContent = info.dimension || '-';
+      document.getElementById('infoCount').textContent = stats.rowCount != null ? stats.rowCount : '-';
+    } catch (e) {
+      document.getElementById('infoName').textContent = '加载失败';
+    }
+  }
+  document.getElementById('refreshInfo').onclick = loadInfo;
+
+  // ===== 单张入库 =====
+  const dropZoneSingle = document.getElementById('dropZoneSingle');
+  const fileInputSingle = document.getElementById('fileInputSingle');
+  let singleFile = null;
+
+  ['dragenter','dragover'].forEach(ev =>
+    dropZoneSingle.addEventListener(ev, e => { e.preventDefault(); dropZoneSingle.classList.add('dragging'); }));
+  ['dragleave','drop'].forEach(ev =>
+    dropZoneSingle.addEventListener(ev, e => { e.preventDefault(); dropZoneSingle.classList.remove('dragging'); }));
+  dropZoneSingle.addEventListener('drop', e => { if (e.dataTransfer.files[0]) setSingleFile(e.dataTransfer.files[0]); });
+  dropZoneSingle.addEventListener('click', () => fileInputSingle.click());
+  fileInputSingle.addEventListener('change', e => { if (e.target.files[0]) setSingleFile(e.target.files[0]); });
+
+  function setSingleFile(f) {
+    if (!f.type.startsWith('image/')) { toast('请选择图片文件', 'error'); return; }
+    singleFile = f;
+    document.getElementById('uploadSingleBtn').disabled = false;
+    document.getElementById('singleStatus').textContent = `已选: ${f.name} (${fmtSize(f.size)})`;
+  }
+  document.getElementById('uploadSingleBtn').onclick = async () => {
+    if (!singleFile) return;
+    setBusy(document.getElementById('uploadSingleBtn'), true, '入库中…');
+    try {
+      const fd = new FormData(); fd.append('file', singleFile);
+      const res = await fetch(API + '/upload', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || '入库失败');
+      toast(`入库成功，ID = ${data.id}`, 'success');
+      loadInfo();
+    } catch (e) { toast('入库失败: ' + e.message, 'error'); }
+    finally { setBusy(document.getElementById('uploadSingleBtn'), false, '📥 入库这张'); }
+  };
+
+  // ===== 批量入库 =====
+  const dropZoneBatch = document.getElementById('dropZoneBatch');
+  const fileInputBatch = document.getElementById('fileInputBatch');
+  let batchFiles = [];
+
+  ['dragenter','dragover'].forEach(ev =>
+    dropZoneBatch.addEventListener(ev, e => { e.preventDefault(); dropZoneBatch.classList.add('dragging'); }));
+  ['dragleave','drop'].forEach(ev =>
+    dropZoneBatch.addEventListener(ev, e => { e.preventDefault(); dropZoneBatch.classList.remove('dragging'); }));
+  dropZoneBatch.addEventListener('drop', e => { addBatchFiles(e.dataTransfer.files); });
+  dropZoneBatch.addEventListener('click', () => fileInputBatch.click());
+  fileInputBatch.addEventListener('change', e => { addBatchFiles(e.target.files); });
+
+  function addBatchFiles(files) {
+    for (const f of files) {
+      if (f.type.startsWith('image/')) batchFiles.push(f);
+    }
+    renderBatchList();
+  }
+  function renderBatchList() {
+    const html = batchFiles.map((f, i) => `
+      <div class="file-item">
+        <span>📄 ${escapeHtml(f.name)}</span>
+        <span class="size">${fmtSize(f.size)}</span>
+      </div>
+    `).join('');
+    document.getElementById('batchFileList').innerHTML = html;
+    document.getElementById('uploadBatchBtn').disabled = batchFiles.length === 0;
+    document.getElementById('batchStatus').textContent = `共 ${batchFiles.length} 张`;
+  }
+  document.getElementById('clearBatchBtn').onclick = () => {
+    batchFiles = []; fileInputBatch.value = ''; renderBatchList();
+  };
+  document.getElementById('uploadBatchBtn').onclick = async () => {
+    if (batchFiles.length === 0) return;
+    setBusy(document.getElementById('uploadBatchBtn'), true, '批量入库中…');
+    try {
+      const fd = new FormData();
+      batchFiles.forEach(f => fd.append('files', f));
+      const res = await fetch(API + '/upload/batch', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || '批量入库失败');
+      toast(`批量入库成功，共 ${data.count} 张`, 'success');
+      batchFiles = []; fileInputBatch.value = ''; renderBatchList();
+      loadInfo();
+    } catch (e) { toast('批量入库失败: ' + e.message, 'error'); }
+    finally { setBusy(document.getElementById('uploadBatchBtn'), false, '📥 批量入库'); }
+  };
+
+  // ===== 本地目录导入 =====
+  document.getElementById('startImportBtn').onclick = async () => {
+    const dir = document.getElementById('importDirInput').value.trim();
+    if (!dir) { toast('请输入目录路径', 'error'); return; }
+    const recursive = document.getElementById('importRecursive').checked;
+    const btn = document.getElementById('startImportBtn');
+    btn.disabled = true;
+    btn.textContent = '导入中…（查看控制台实时日志）';
+    document.getElementById('importStatus').textContent = '正在导入，请查看 IDEA / 命令行控制台中的实时日志…';
+    document.getElementById('importProgress').style.display = 'block';
+    document.getElementById('importStats').style.display = 'none';
+    document.getElementById('importProgressFill').style.width = '40%';
+    try {
+      const url = `${API}/import?dir=${encodeURIComponent(dir)}&recursive=${recursive}&batchSize=16`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `导入失败（HTTP ${res.status}）`);
+      document.getElementById('importProgressFill').style.width = '100%';
+      document.getElementById('importStats').style.display = 'grid';
+      document.getElementById('statScanned').textContent = data.scanned ?? '-';
+      document.getElementById('statInserted').textContent = data.inserted ?? '-';
+      document.getElementById('statSkipped').textContent = data.skipped ?? '-';
+      document.getElementById('statFailed').textContent = data.failed ?? '-';
+      const sec = ((data.durationMs ?? 0) / 1000).toFixed(1);
+      document.getElementById('statDuration').textContent = sec;
+      const msg = `完成！入库 ${data.inserted} 张，跳过 ${data.skipped} 张，失败 ${data.failed} 张，耗时 ${sec}s`;
+      document.getElementById('importStatus').textContent = msg;
+      if (data.inserted > 0) { toast(msg, 'success'); loadInfo(); }
+      else { toast(msg, data.failed > 0 ? 'error' : 'warn'); }
+    } catch (e) {
+      document.getElementById('importProgress').style.display = 'none';
+      document.getElementById('importStatus').textContent = '';
+      toast('导入失败: ' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '🚀 开始导入';
+    }
+  };
+
+  // ===== 以图搜图 =====
+  const dropZoneQuery = document.getElementById('dropZoneQuery');
+  const fileInputQuery = document.getElementById('fileInputQuery');
+  let queryFile = null;
+
+  ['dragenter','dragover'].forEach(ev =>
+    dropZoneQuery.addEventListener(ev, e => { e.preventDefault(); dropZoneQuery.classList.add('dragging'); }));
+  ['dragleave','drop'].forEach(ev =>
+    dropZoneQuery.addEventListener(ev, e => { e.preventDefault(); dropZoneQuery.classList.remove('dragging'); }));
+  dropZoneQuery.addEventListener('drop', e => { if (e.dataTransfer.files[0]) setQueryFile(e.dataTransfer.files[0]); });
+  dropZoneQuery.addEventListener('click', () => fileInputQuery.click());
+  fileInputQuery.addEventListener('change', e => { if (e.target.files[0]) setQueryFile(e.target.files[0]); });
+
+  function setQueryFile(f) {
+    if (!f.type.startsWith('image/')) { toast('请选择图片文件', 'error'); return; }
+    queryFile = f;
+    const r = new FileReader();
+    r.onload = e => document.getElementById('queryPreview').innerHTML = `<img src="${e.target.result}">`;
+    r.readAsDataURL(f);
+    document.getElementById('searchBtn').disabled = false;
+    document.getElementById('queryStatus').textContent = `已选: ${f.name}`;
+  }
+  document.getElementById('clearQueryBtn').onclick = () => {
+    queryFile = null; fileInputQuery.value = '';
+    document.getElementById('queryPreview').innerHTML = '<span>尚未选择图片</span>';
+    document.getElementById('resultsArea').innerHTML = '<div class="empty">暂无结果。点击「开始搜索」开始检索。</div>';
+    document.getElementById('searchBtn').disabled = true;
+    document.getElementById('queryStatus').textContent = '';
+  };
+  document.getElementById('queryPreview').addEventListener('click', e => {
+    const img = e.target.closest('img');
+    if (img && img.src) openLightbox(img.src, '查询图预览');
+  });
+  document.getElementById('searchBtn').onclick = async () => {
+    if (!queryFile) return;
+    setBusy(document.getElementById('searchBtn'), true, '检索中…');
+    document.getElementById('resultsArea').innerHTML = '<div class="empty">检索中…</div>';
+    try {
+      const fd = new FormData();
+      fd.append('file', queryFile);
+      fd.append('topK', document.getElementById('topK').value || 10);
+      const res = await fetch(API + '/search', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || '搜索失败');
+      renderResults(data.results || []);
+    } catch (e) {
+      document.getElementById('resultsArea').innerHTML = `<div class="empty">❌ ${e.message}</div>`;
+      toast('搜索失败: ' + e.message, 'error');
+    } finally { setBusy(document.getElementById('searchBtn'), false, '🔍 开始搜索'); }
+  };
+
+  function renderResults(results) {
+    if (!results.length) {
+      document.getElementById('resultsArea').innerHTML = '<div class="empty">没有匹配结果。请先在「索引图片」中添加一些图片。</div>';
+      return;
+    }
+    const html = '<div class="results-grid">' + results.map((r, i) => `
+      <div class="result-card" data-img="${escapeHtml(r.imagePath || '')}" data-caption="相似度: ${r.similarity}　·　ID: ${escapeHtml(r.id)}">
+        <img src="${escapeHtml(r.imagePath || '')}" onerror="this.style.background='#fee';this.alt='加载失败'" alt="result ${i+1}">
+        <div class="result-info">
+          <div class="result-score">相似度: ${r.similarity}</div>
+          <div class="result-id">ID: ${r.id}</div>
+        </div>
+      </div>
+    `).join('') + '</div>';
+    const area = document.getElementById('resultsArea');
+    area.innerHTML = html;
+    area.querySelectorAll('.result-card').forEach(card => {
+      card.addEventListener('click', () => {
+        openLightbox(card.dataset.img, card.dataset.caption);
+      });
+    });
+  }
+
+  // ===== 集合管理 =====
+  async function loadManageInfo() {
+    try {
+      const info = await fetch(API + '/info').then(r => r.json());
+      const stats = await fetch(API + '/stats?sampleSize=1').then(r => r.json());
+      document.getElementById('mName').textContent = info.collectionName || '-';
+      document.getElementById('mExists').textContent = info.exists ? '是' : '否';
+      document.getElementById('mCount').textContent = stats.rowCount != null ? stats.rowCount : '-';
+    } catch (e) {
+      toast('加载失败: ' + e.message, 'error');
+    }
+  }
+  document.getElementById('loadSamplesBtn').onclick = async () => {
+    const size = document.getElementById('sampleSize').value || 50;
+    document.getElementById('galleryArea').innerHTML = '<div class="empty">加载中…</div>';
+    try {
+      const stats = await fetch(`${API}/stats?sampleSize=${size}`).then(r => r.json());
+      const samples = stats.samples || [];
+      if (samples.length === 0) {
+        document.getElementById('galleryArea').innerHTML = '<div class="empty">集合为空，请先索引一些图片</div>';
+        return;
+      }
+      const html = '<div class="gallery">' + samples.map(s => `
+        <div class="gallery-item" data-img="${escapeHtml(s.imagePath || '')}" data-caption="ID: ${escapeHtml(s.id)}">
+          <img src="${escapeHtml(s.imagePath || '')}" onerror="this.style.background='#fee'" alt="">
+          <div class="gid">ID: ${s.id}</div>
+        </div>
+      `).join('') + '</div>';
+      const area = document.getElementById('galleryArea');
+      area.innerHTML = html;
+      area.querySelectorAll('.gallery-item').forEach(item => {
+        item.addEventListener('click', () => openLightbox(item.dataset.img, item.dataset.caption));
+      });
+    } catch (e) {
+      document.getElementById('galleryArea').innerHTML = `<div class="empty">❌ ${e.message}</div>`;
+    }
+  };
+  document.getElementById('resetBtn').onclick = async () => {
+    if (!confirm('确定要清空集合并重建吗？所有已索引的图片数据都会丢失！')) return;
+    setBusy(document.getElementById('resetBtn'), true, '重置中…');
+    try {
+      const res = await fetch(API + '/reset', { method: 'DELETE' });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || '重置失败');
+      toast('集合已重置', 'success');
+      loadInfo(); loadManageInfo();
+      document.getElementById('galleryArea').innerHTML = '<div class="empty">集合已重置</div>';
+    } catch (e) { toast('重置失败: ' + e.message, 'error'); }
+    finally { setBusy(document.getElementById('resetBtn'), false, '⚠ 重置集合（清空）'); }
+  };
+
+  // ===== 运行示例 =====
+  const consoleArea = document.getElementById('consoleArea');
+  function log(text, type) {
+    const cls = type ? `log-${type}` : 'log-info';
+    const ts = new Date().toLocaleTimeString();
+    consoleArea.innerHTML += `<div class="log-line ${cls}">[${ts}] ${escapeHtml(text)}</div>`;
+    consoleArea.scrollTop = consoleArea.scrollHeight;
+  }
+  document.getElementById('clearLogBtn').onclick = () => { consoleArea.innerHTML = ''; };
+
+  document.getElementById('runDemoBtn').onclick = async () => {
+    setBusy(document.getElementById('runDemoBtn'), true, '运行中…');
+    consoleArea.innerHTML = '';
+    try {
+      log('🚀 开始运行示例演示', 'info');
+      log('① 重置集合...', 'info');
+      const resetRes = await fetch(API + '/reset', { method: 'DELETE' }).then(r => r.json());
+      if (!resetRes.success) throw new Error(resetRes.error);
+      log('   ✓ 集合已重置', 'success');
+
+      log('② 检查集合信息...', 'info');
+      const info = await fetch(API + '/info').then(r => r.json());
+      log(`   ✓ 集合: ${info.collectionName}, 维度: ${info.dimension}, 存在: ${info.exists}`, 'success');
+
+      log('③ 模拟索引示例图片...', 'info');
+      log('   (示例图需要您手动上传，请前往「索引图片」添加)', 'warn');
+      log('   这里仅打印操作流程：', 'info');
+      log('   - POST /api/image-search/upload (单张)', 'info');
+      log('   - POST /api/image-search/upload/batch (批量)', 'info');
+
+      log('④ 模拟以图搜图...', 'info');
+      log('   流程：POST /api/image-search/search?file=...&topK=10', 'info');
+      log('   请在「以图搜图」Tab 上传查询图', 'warn');
+
+      log('🎉 示例流程演示完成！', 'success');
+    } catch (e) {
+      log('❌ 出错: ' + e.message, 'error');
+    } finally {
+      setBusy(document.getElementById('runDemoBtn'), false, '▶ 一键运行示例');
+    }
+  };
+
+  // 启动
+  loadInfo();
+</script>
+</body>
+</html>
