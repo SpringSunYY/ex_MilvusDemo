@@ -3,6 +3,7 @@ package com.yy.milvus.service.feature;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.concurrent.ExecutorService;
 
 /**
  * 特征提取器统一接口。
@@ -52,6 +53,39 @@ public interface FeatureExtractor {
      * @throws IOException 无法解码或推理失败
      */
     float[] extractFeature(byte[] imageBytes) throws IOException;
+
+    /**
+     * 可选：把特征提取时传入线程池。
+     * <p>
+     * 对于多尺度 / HFlip 等"同一张图需要多次 ONNX 推理"的模型，传入 ExecutorService 后可以让多次推理
+     * 真正并发执行（每次推理借不同 session），单张图耗时 ≈ max 而不是 sum。
+     * <p>
+     * 调用方约定：
+     * <ul>
+     *   <li>传 {@code null} → 不并发（与不带 executor 的版本等价）</li>
+     *   <li>传非空 → 调用方负责保证容量充足，否则实现内部可能同步等待 session</li>
+     * </ul>
+     * <p>
+     * 默认实现把任务转发到无 executor 的版本，等价于不并发；
+     * 支持并发的模型（如 DINOv2）应当 override 此方法。
+     */
+    default float[] extractFeature(File imageFile, ExecutorService exec) throws IOException {
+        return extractFeature(imageFile);
+    }
+
+    /**
+     * 同 {@link #extractFeature(File, ExecutorService)}，但数据来自输入流
+     */
+    default float[] extractFeature(InputStream inputStream, ExecutorService exec) throws IOException {
+        return extractFeature(inputStream);
+    }
+
+    /**
+     * 同 {@link #extractFeature(File, ExecutorService)}，但数据来自字节数组
+     */
+    default float[] extractFeature(byte[] imageBytes, ExecutorService exec) throws IOException {
+        return extractFeature(imageBytes);
+    }
 
     /**
      * 特征向量维度。

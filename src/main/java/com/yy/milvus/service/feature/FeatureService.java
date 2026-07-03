@@ -12,6 +12,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
 
 /**
  * 特征提取服务：多模型注册中心。
@@ -107,6 +108,13 @@ public class FeatureService {
     }
 
     /**
+     * 从图片文件提取特征向量（默认模型，传入并发执行器）。
+     */
+    public float[] extract(File imageFile, ExecutorService exec) throws IOException {
+        return getExtractor().extractFeature(imageFile, exec);
+    }
+
+    /**
      * 从图片文件提取特征向量（指定模型）。
      */
     public float[] extract(File imageFile, String model) throws IOException {
@@ -118,5 +126,12 @@ public class FeatureService {
      */
     public float[] extract(InputStream in, String model) throws IOException {
         return getExtractor(model).extractFeature(in);
+    }
+
+    /**
+     * 从输入流提取特征向量（指定模型 + 并发执行器）。
+     */
+    public float[] extract(InputStream in, String model, ExecutorService exec) throws IOException {
+        return getExtractor(model).extractFeature(in, exec);
     }
 }

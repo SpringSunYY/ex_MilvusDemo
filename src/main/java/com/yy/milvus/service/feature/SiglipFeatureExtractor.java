@@ -199,8 +199,8 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
             //    如果 cores 远大于此，可放大到 8 个一组 session × intra 8 = 64 线程 ——
             //    但 session × intra 超过 cores 时反而会因上下文切换降速。
             int poolSizeConfigured = embeddingProps.getSiglip().getSessionPoolSize();
-            if (poolSizeConfigured <= 0) poolSizeConfigured = Math.min(Math.max(1, cores), 8);
-            int intra = Math.max(1, Math.min(8, cores / Math.max(1, poolSizeConfigured)));
+            if (poolSizeConfigured <= 0) poolSizeConfigured = Math.clamp(cores, 1, 8);
+            int intra = Math.clamp(cores / poolSizeConfigured, 1, 8);
             if (intra < 1) intra = 1;
 
             opts.setIntraOpNumThreads(intra);
@@ -753,11 +753,13 @@ public class SiglipFeatureExtractor implements FeatureExtractor {
         return out;
     }
 
-    @Override public int getFeatureDim() {
+    @Override
+    public int getFeatureDim() {
         return embeddingProps.getSiglip().getFeatureDim();
     }
 
-    @Override public String getModelName() {
+    @Override
+    public String getModelName() {
         return "siglip";
     }
 }

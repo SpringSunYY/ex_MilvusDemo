@@ -90,6 +90,17 @@ public class EmbeddingProperties {
 
         /** 水平翻转增强（不建议开启，DINOv2 对翻转敏感） */
         private boolean hflipEnabled = false;
+
+        /**
+         * 批量入库模式开关。ORT Java 1.18 的 IntraOpNum 只能在 session 创建那一刻设，
+         * 不能运行时改。所以这里改成"启动期一次性选"：
+         *   batch-mode = true  → IntraOp=1（批量 16 张图并发时不抢 CPU，最稳）
+         *   batch-mode = false → IntraOp=cores/6（6 个 session 内多线程榨干 CPU，搜图专用）
+         *
+         * 单图搜图服务 → 设 batch-mode: false
+         * 同时跑批量入库 → 设 batch-mode: true
+         */
+        private boolean batchMode = true;
     }
 
     @Data
