@@ -1,5 +1,7 @@
 package com.yy.milvus.controller;
 
+import com.yy.milvus.domain.QueryCondition;
+import com.yy.milvus.domain.QueryResult;
 import com.yy.milvus.domain.SearchResult;
 import com.yy.milvus.service.ImageIndexService;
 import com.yy.milvus.service.MilvusService;
@@ -141,6 +143,224 @@ public class ImageSearchController {
         } catch (Exception e) {
             log.error("Failed to get stats", e);
             return badRequest(e.getMessage());
+        }
+    }
+
+    // ==================== 字段查询 / 条件查询 ====================
+
+    /**
+     * 按主键 id 查询单条记录。
+     */
+    @GetMapping("/query/id/{id}")
+    public ResponseEntity<Map<String, Object>> queryById(@PathVariable("id") String id) {
+        try {
+            QueryResult r = imageIndexService.queryById(id);
+            if (r == null) {
+                return ResponseEntity.ok(Map.of("success", true, "found", false, "id", id));
+            }
+            r.setImagePath(toUrl(r.getImagePath()));
+            return ResponseEntity.ok(Map.of("success", true, "found", true, "result", r));
+        } catch (Exception e) {
+            log.error("Failed to query by id", e);
+            return badRequest(e.getMessage());
+        }
+    }
+
+    /**
+     * 按图片路径精确查询。
+     */
+    @GetMapping("/query/path")
+    public ResponseEntity<Map<String, Object>> queryByPath(@RequestParam("path") String imagePath) {
+        try {
+            List<QueryResult> results = imageIndexService.queryByImagePath(imagePath);
+            results.forEach(r -> r.setImagePath(toUrl(r.getImagePath())));
+            Map<String, Object> resp = new HashMap<>();
+            resp.put("success", true);
+            resp.put("queryPath", toUrl(imagePath));
+            resp.put("totalResults", results.size());
+            resp.put("results", results);
+            return ResponseEntity.ok(resp);
+        } catch (Exception e) {
+            log.error("Failed to query by path", e);
+            return badRequest(e.getMessage());
+        }
+    }
+
+    /**
+     * 按图片路径模糊查询（LIKE '%path%'）。
+     */
+    @GetMapping("/query/path/like")
+    public ResponseEntity<Map<String, Object>> queryByPathLike(
+            @RequestParam("keyword") String keyword,
+            @RequestParam(value = "limit", defaultValue = "100") int limit) {
+        try {
+            int lim = limit <= 0 ? 100 : Math.min(limit, 1000);
+            QueryCondition cond = QueryCondition.builder()
+                    .contains("image_path", keyword)
+                    .build();
+            List<QueryResult> results = imageIndexService.queryByCondition(cond, false, lim);
+            results.forEach(r -> r.setImagePath(toUrl(r.getImagePath())));
+            Map<String, Object> resp = new HashMap<>();
+            resp.put("success", true);
+            resp.put("keyword", keyword);
+            resp.put("totalResults", results.size());
+            resp.put("results", results);
+            return ResponseEntity.ok(resp);
+        } catch (Exception e) {
+            log.error("Failed to query by path like", e);
+            return badRequest(e.getMessage());
+        }
+    }
+
+    /**
+     * 按入库时间范围查询。
+     */
+    @GetMapping("/query/time-range")
+    public ResponseEntity<Map<String, Object>> queryByTimeRange(
+            @RequestParam(value = "from", required = false) Long from,
+            @RequestParam(value = "to", required = false) Long to,
+            @RequestParam(value = "limit", defaultValue = "100") int limit) {
+        try {
+            int lim = limit <= 0 ? 100 : Math.min(limit, 1000);
+            List<QueryResult> results = imageIndexService.queryByCreatedAtRange(from, to);
+            // 业务层不限 limit，这里手工截
+            if (results.size() > lim) results = results.subList(0, lim);
+            results.forEach(r -> r.setImagePath(toUrl(r.getImagePath())));
+            Map<String, Object> resp = new HashMap<>();
+            resp.put("success", true);
+            resp.put("from", from);
+            resp.put("to", to);
+            resp.put("totalResults", results.size());
+            resp.put("results", results);
+            return ResponseEntity.ok(resp);
+        } catch (Exception e) {
+            log.error("Failed to query by time range", e);
+            return badRequest(e.getMessage());
+        }
+    }
+
+    /**
+     * 通用条件查询（POST + JSON body）。
+     *
+     * <p>请求体格式：
+     * <pre>{@code
+     * {
+     *   "imagePath": "images/cat.jpg",       // 可选：image_path 等值匹配
+     *   "pathPrefix": "images/",              // 可选：image_path 前缀
+     *   "pathContains": "cat",                // 可选：image_path 包含
+     *   "idIn": ["a", "b"],                   // 可选：id IN [...]
+     *   "from": 1700000000000,                // 可选：created_at 下界（毫秒，含）
+     *   "to":   1800000000000,                // 可选：created_at 上界（毫秒，含）
+     *   "withVector": false,                  // 可选：是否返回向量（默认 false）
+     *   "limit": 100                          // 可选：返回条数上限（默认 100，最大 1000）
+     * }
+     * }</pre>
+     */
+    @PostMapping("/query")
+    public ResponseEntity<Map<String, Object>> queryByCondition(@RequestBody Map<String, Object> body) {
+        try {
+            QueryCondition.Builder b = QueryCondition.builder();
+
+            String id = strOrNull(body, "id");
+            if (id != null) b.eq("id", id);
+
+            String imagePath = strOrNull(body, "imagePath");
+            if (imagePath != null) b.eq("image_path", imagePath);
+
+            String pathPrefix = strOrNull(body, "pathPrefix");
+            if (pathPrefix != null) b.startsWith("image_path", pathPrefix);
+
+            String pathContains = strOrNull(body, "pathContains");
+            if (pathContains != null) b.contains("image_path", pathContains);
+
+            Object idInRaw = body.get("idIn");
+            if (idInRaw instanceof List<?> idInList) {
+                List<String> ids = new ArrayList<>();
+                for (Object o : idInList) if (o != null) ids.add(o.toString());
+                if (!ids.isEmpty()) b.in("id", ids);
+            }
+
+            Long from = longOrNull(body, "from");
+            if (from != null) b.gte("created_at", from);
+
+            Long to = longOrNull(body, "to");
+            if (to != null) b.lte("created_at", to);
+
+            boolean withVector = Boolean.TRUE.equals(body.get("withVector"));
+            int limit = intOrDefault(body, "limit", 100);
+            if (limit <= 0) limit = 100;
+            limit = Math.min(limit, 1000);
+
+            List<QueryResult> results = imageIndexService.queryByCondition(b.build(), withVector, limit);
+            results.forEach(r -> r.setImagePath(toUrl(r.getImagePath())));
+
+            Map<String, Object> resp = new HashMap<>();
+            resp.put("success", true);
+            resp.put("expr", b.build().toExpr());
+            resp.put("withVector", withVector);
+            resp.put("totalResults", results.size());
+            resp.put("results", results);
+            return ResponseEntity.ok(resp);
+        } catch (Exception e) {
+            log.error("Failed to query by condition", e);
+            return badRequest(e.getMessage());
+        }
+    }
+
+    /**
+     * 高级：直接传 Milvus expr 字符串（不走白名单）。
+     * <b>注意</b>：此接口无字段名白名单校验，调用方需自行保证 expr 安全。
+     */
+    @PostMapping("/query/raw")
+    public ResponseEntity<Map<String, Object>> queryByRawExpr(@RequestBody Map<String, Object> body) {
+        try {
+            String expr = strOrNull(body, "expr");
+            if (expr == null) throw new IllegalArgumentException("expr 不可为空");
+            boolean withVector = Boolean.TRUE.equals(body.get("withVector"));
+            int limit = intOrDefault(body, "limit", 100);
+            if (limit <= 0) limit = 100;
+            limit = Math.min(limit, 1000);
+
+            List<QueryResult> results = imageIndexService.queryByRawExpr(expr, withVector, limit);
+            results.forEach(r -> r.setImagePath(toUrl(r.getImagePath())));
+
+            Map<String, Object> resp = new HashMap<>();
+            resp.put("success", true);
+            resp.put("expr", expr);
+            resp.put("withVector", withVector);
+            resp.put("totalResults", results.size());
+            resp.put("results", results);
+            return ResponseEntity.ok(resp);
+        } catch (Exception e) {
+            log.error("Failed to query by raw expr", e);
+            return badRequest(e.getMessage());
+        }
+    }
+
+    private static String strOrNull(Map<String, Object> body, String key) {
+        Object v = body.get(key);
+        return v == null ? null : v.toString();
+    }
+
+    private static Long longOrNull(Map<String, Object> body, String key) {
+        Object v = body.get(key);
+        if (v == null) return null;
+        if (v instanceof Number n) return n.longValue();
+        try {
+            return Long.parseLong(v.toString());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("字段 " + key + " 不是合法 Long: " + v);
+        }
+    }
+
+    private static int intOrDefault(Map<String, Object> body, String key, int def) {
+        Object v = body.get(key);
+        if (v == null) return def;
+        if (v instanceof Number n) return n.intValue();
+        try {
+            return Integer.parseInt(v.toString());
+        } catch (NumberFormatException e) {
+            return def;
         }
     }
 

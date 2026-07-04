@@ -2,6 +2,8 @@ package com.yy.milvus.service;
 
 import com.google.common.collect.Lists;
 import com.yy.milvus.config.MilvusProperties;
+import com.yy.milvus.domain.QueryCondition;
+import com.yy.milvus.domain.QueryResult;
 import com.yy.milvus.domain.SearchResult;
 import com.yy.milvus.domain.VectorRecord;
 import com.yy.milvus.service.feature.FeatureExtractor;
@@ -481,6 +483,189 @@ public class MilvusService {
                         .build()
         );
         log.info("Collection '{}' dropped", collectionName);
+    }
+
+    // ==================== 字段查询 / 条件查询 ====================
+
+    /**
+     * 按单个 id 查询单条记录（不带向量）。
+     *
+     * @param id 主键
+     * @return 找到则返回记录；找不到返回 null
+     */
+    public QueryResult queryById(String id) {
+        if (id == null || id.isEmpty()) return null;
+        List<QueryResult> list = queryByCondition(
+                QueryCondition.builder().eq(PRIMARY_KEY_FIELD, id).build(),
+                false);
+        return list.isEmpty() ? null : list.get(0);
+    }
+
+    /**
+     * 按单个 id 查询单条记录，可选是否带向量。
+     */
+    public QueryResult queryById(String id, boolean withVector) {
+        if (id == null || id.isEmpty()) return null;
+        List<QueryResult> list = queryByCondition(
+                QueryCondition.builder().eq(PRIMARY_KEY_FIELD, id).build(),
+                withVector);
+        return list.isEmpty() ? null : list.get(0);
+    }
+
+    /**
+     * 按图片路径精确匹配查询记录（不带向量）。
+     * 注意：image_path 在 schema 里没有建索引，数据量大时可能慢。
+     */
+    public List<QueryResult> queryByImagePath(String imagePath) {
+        if (imagePath == null || imagePath.isEmpty()) return Collections.emptyList();
+        return queryByCondition(
+                QueryCondition.builder().eq(IMAGE_PATH_FIELD, imagePath).build(),
+                false);
+    }
+
+    /**
+     * 按图片路径模糊匹配（LIKE '%path%'），不带向量。
+     */
+    public List<QueryResult> queryByImagePathLike(String substring) {
+        if (substring == null || substring.isEmpty()) return Collections.emptyList();
+        return queryByCondition(
+                QueryCondition.builder().contains(IMAGE_PATH_FIELD, substring).build(),
+                false);
+    }
+
+    /**
+     * 按图片路径前缀匹配（LIKE 'prefix%'），不带向量。
+     */
+    public List<QueryResult> queryByImagePathPrefix(String prefix) {
+        if (prefix == null || prefix.isEmpty()) return Collections.emptyList();
+        return queryByCondition(
+                QueryCondition.builder().startsWith(IMAGE_PATH_FIELD, prefix).build(),
+                false);
+    }
+
+    /**
+     * 按入库时间范围查询记录。
+     *
+     * @param fromInclusive 起始时间戳（毫秒，包含）；null 表示不限
+     * @param toInclusive   结束时间戳（毫秒，包含）；null 表示不限
+     */
+    public List<QueryResult> queryByCreatedAtRange(Long fromInclusive, Long toInclusive) {
+        QueryCondition.Builder b = QueryCondition.builder();
+        if (fromInclusive != null) b.gte(CREATED_AT_FIELD, fromInclusive);
+        if (toInclusive != null) b.lte(CREATED_AT_FIELD, toInclusive);
+        return queryByCondition(b.build(), false);
+    }
+
+    /**
+     * 按 {@link QueryCondition}（类型化条件构造器）查询多条记录。
+     *
+     * <p>默认不返回向量。如需向量请显式传 {@code withVector=true}。
+     */
+    public List<QueryResult> queryByCondition(QueryCondition condition) {
+        return queryByCondition(condition, false);
+    }
+
+    /**
+     * 按 {@link QueryCondition} 查询，可选是否返回向量。
+     */
+    public List<QueryResult> queryByCondition(QueryCondition condition, boolean withVector) {
+        if (condition == null || condition.isEmpty()) {
+            throw new IllegalArgumentException("QueryCondition 不可为空且至少包含一个条件");
+        }
+        return executeFieldQuery(condition.toExpr(), withVector, -1);
+    }
+
+    /**
+     * 按 {@link QueryCondition} 查询并限制返回条数。
+     */
+    public List<QueryResult> queryByCondition(QueryCondition condition, boolean withVector, int limit) {
+        if (condition == null || condition.isEmpty()) {
+            throw new IllegalArgumentException("QueryCondition 不可为空且至少包含一个条件");
+        }
+        if (limit <= 0) throw new IllegalArgumentException("limit 必须 > 0");
+        return executeFieldQuery(condition.toExpr(), withVector, limit);
+    }
+
+    /**
+     * 直接传原始 Milvus expr 字符串查询（不走白名单）。
+     *
+     * <p>适用场景：QueryCondition 表达不了的复杂查询（OR、子查询、JSON 字段等）。
+     * <b>注意</b>：本方法不做 expr 注入防护，调用方需自行保证 expr 安全。
+     */
+    public List<QueryResult> queryByRawExpr(String expr) {
+        return queryByRawExpr(expr, false, -1);
+    }
+
+    public List<QueryResult> queryByRawExpr(String expr, boolean withVector, int limit) {
+        if (expr == null || expr.isBlank()) {
+            throw new IllegalArgumentException("expr 不可为空");
+        }
+        return executeFieldQuery(expr.trim(), withVector, limit);
+    }
+
+    /**
+     * 内部：实际执行 expr 查询并解析为 QueryResult。
+     *
+     * @param expr        Milvus 过滤表达式
+     * @param withVector  是否把向量字段带回
+     * @param limit       返回条数上限；<=0 表示不限制
+     */
+    private List<QueryResult> executeFieldQuery(String expr, boolean withVector, int limit) {
+        try {
+            ensureCollectionLoaded();
+        } catch (Exception e) {
+            log.warn("[executeFieldQuery] ensureCollectionLoaded 失败: {}", e.getMessage());
+            return Collections.emptyList();
+        }
+
+        List<String> outFields = new ArrayList<>(Arrays.asList(
+                PRIMARY_KEY_FIELD, IMAGE_PATH_FIELD, CREATED_AT_FIELD));
+        if (withVector) {
+            outFields.add(FEATURE_VECTOR_FIELD);
+        }
+
+        try {
+            io.milvus.param.dml.QueryParam.Builder qb = QueryParam.newBuilder()
+                    .withCollectionName(collectionName)
+                    .withOutFields(outFields)
+                    .withExpr(expr);
+            if (limit > 0) {
+                qb.withLimit((long) limit);
+            }
+
+            R<io.milvus.grpc.QueryResults> qr = milvusClient.query(qb.build());
+            if (qr.getStatus() != R.Status.Success.getCode()) {
+                log.warn("[executeFieldQuery] 失败 expr='{}' : {}", expr, qr.getMessage());
+                return Collections.emptyList();
+            }
+            QueryResultsWrapper qw = new QueryResultsWrapper(qr.getData());
+            List<QueryResult> results = new ArrayList<>();
+            for (QueryResultsWrapper.RowRecord row : qw.getRowRecords()) {
+                QueryResult r = new QueryResult();
+                Object idObj = row.get(PRIMARY_KEY_FIELD);
+                if (idObj != null) r.setId(idObj.toString());
+                Object pathObj = row.get(IMAGE_PATH_FIELD);
+                if (pathObj != null) r.setImagePath(pathObj.toString());
+                Object tsObj = row.get(CREATED_AT_FIELD);
+                if (tsObj instanceof Number) r.setCreatedAt(((Number) tsObj).longValue());
+                if (withVector) {
+                    Object vecObj = row.get(FEATURE_VECTOR_FIELD);
+                    if (vecObj instanceof List<?> vecList) {
+                        float[] arr = new float[vecList.size()];
+                        for (int i = 0; i < vecList.size(); i++) {
+                            Object v = vecList.get(i);
+                            arr[i] = (v instanceof Number) ? ((Number) v).floatValue() : 0f;
+                        }
+                        r.setVector(arr);
+                    }
+                }
+                results.add(r);
+            }
+            return results;
+        } catch (Exception e) {
+            log.warn("[executeFieldQuery] 异常 expr='{}' : {}", expr, e.getMessage());
+            return Collections.emptyList();
+        }
     }
 
     /**

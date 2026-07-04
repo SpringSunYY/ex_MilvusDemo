@@ -2,6 +2,8 @@ package com.yy.milvus.service;
 
 import com.yy.milvus.config.EmbeddingProperties;
 import com.yy.milvus.config.MilvusProperties;
+import com.yy.milvus.domain.QueryCondition;
+import com.yy.milvus.domain.QueryResult;
 import com.yy.milvus.domain.SearchResult;
 import com.yy.milvus.domain.VectorRecord;
 import com.yy.milvus.service.feature.FeatureExtractor;
@@ -306,6 +308,76 @@ public class ImageIndexService {
         List<SearchResult> results = milvusService.searchByVector(vec, topK);
         log.info("[以图搜图] 耗时 {}ms (提特征+Milvus搜索)", System.currentTimeMillis() - t0);
         return results;
+    }
+
+    // ==================== 字段查询 / 条件查询编排 ====================
+
+    /**
+     * 按 id 查单条记录（不带向量）。
+     */
+    public QueryResult queryById(String id) {
+        return milvusService.queryById(id);
+    }
+
+    /**
+     * 按 id 查单条记录，可选是否带向量。
+     */
+    public QueryResult queryById(String id, boolean withVector) {
+        return milvusService.queryById(id, withVector);
+    }
+
+    /**
+     * 按图片路径精确查记录。
+     */
+    public List<QueryResult> queryByImagePath(String imagePath) {
+        return milvusService.queryByImagePath(imagePath);
+    }
+
+    /**
+     * 按图片路径模糊查（LIKE '%path%'）。
+     */
+    public List<QueryResult> queryByImagePathLike(String substring) {
+        return milvusService.queryByImagePathLike(substring);
+    }
+
+    /**
+     * 按图片路径前缀查（LIKE 'prefix%'）。
+     */
+    public List<QueryResult> queryByImagePathPrefix(String prefix) {
+        return milvusService.queryByImagePathPrefix(prefix);
+    }
+
+    /**
+     * 按入库时间范围查记录。
+     */
+    public List<QueryResult> queryByCreatedAtRange(Long fromInclusive, Long toInclusive) {
+        return milvusService.queryByCreatedAtRange(fromInclusive, toInclusive);
+    }
+
+    /**
+     * 按类型化条件查询。
+     */
+    public List<QueryResult> queryByCondition(QueryCondition condition) {
+        return milvusService.queryByCondition(condition);
+    }
+
+    public List<QueryResult> queryByCondition(QueryCondition condition, boolean withVector) {
+        return milvusService.queryByCondition(condition, withVector);
+    }
+
+    public List<QueryResult> queryByCondition(QueryCondition condition, boolean withVector, int limit) {
+        return milvusService.queryByCondition(condition, withVector, limit);
+    }
+
+    /**
+     * 直接传原始 Milvus expr 字符串查询（不走白名单，调用方需自行保证 expr 安全）。
+     */
+    public List<QueryResult> queryByRawExpr(String expr) {
+        return milvusService.queryByRawExpr(expr);
+    }
+
+    public List<QueryResult> queryByRawExpr(String expr, boolean withVector, int limit) {
+        return milvusService.queryByRawExpr(expr, withVector, limit);
     }
 
     // ==================== 内部辅助 ====================

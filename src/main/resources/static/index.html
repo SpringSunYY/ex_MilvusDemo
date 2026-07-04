@@ -162,6 +162,84 @@
 
   @media (max-width: 720px) { .preview-row { flex-direction: column; } }
 
+  /* ===== 查询 Tab ===== */
+  .query-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px;
+  }
+  @media (max-width: 900px) { .query-grid { grid-template-columns: 1fr; } }
+  .query-card {
+    background: #f8f9ff; border: 1px solid #e0e4f8; border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .query-card h3 {
+    font-size: 13px; color: #667eea; margin: 0 0 10px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .query-card .desc {
+    font-size: 12px; color: #888; margin-bottom: 10px; line-height: 1.5;
+  }
+  .query-form-row {
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px;
+  }
+  .query-form-row:last-child { margin-bottom: 0; }
+  .query-form-row label {
+    font-size: 12px; color: #555; min-width: 70px; white-space: nowrap;
+  }
+  .query-input {
+    flex: 1; min-width: 140px;
+    padding: 8px 10px; border: 1px solid #d8dce6; border-radius: 6px;
+    font-size: 13px;
+  }
+  .query-input.mono { font-family: "Cascadia Code", "Consolas", monospace; font-size: 12px; }
+  .query-input.lg { font-size: 13px; }
+  .query-meta {
+    display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: #666;
+    margin-bottom: 10px; padding: 8px 12px; background: #fff;
+    border-radius: 6px; border: 1px solid #eef0f6;
+  }
+  .query-meta b { color: #333; }
+  .query-results-bar {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 10px;
+  }
+  .query-results-bar .title { font-size: 14px; color: #444; font-weight: 600; }
+  .query-results-bar .title b { color: #667eea; }
+  .query-results-bar .expr {
+    font-family: "Cascadia Code", "Consolas", monospace; font-size: 11px;
+    color: #888; max-width: 60%; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .query-card-empty {
+    grid-column: 1 / -1; color: #aaa; text-align: center;
+    padding: 36px; font-size: 14px;
+  }
+  .query-result-card {
+    background: #fff; border-radius: 10px; overflow: hidden;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    transition: transform 0.15s; border: 1px solid #eef0f6;
+    cursor: zoom-in; display: flex; flex-direction: column;
+  }
+  .query-result-card:hover { transform: translateY(-3px); box-shadow: 0 6px 16px rgba(0,0,0,0.12); }
+  .query-result-card img {
+    width: 100%; height: 130px; object-fit: cover; display: block;
+    background: #f6f7fb;
+  }
+  .query-result-card .qrc-body { padding: 8px 10px; font-size: 11px; line-height: 1.5; }
+  .query-result-card .qrc-id { font-family: monospace; color: #555; font-weight: 600; word-break: break-all; }
+  .query-result-card .qrc-path {
+    color: #888; font-size: 10px; word-break: break-all;
+    margin-top: 2px;
+  }
+  .query-result-card .qrc-time { color: #999; font-size: 10px; margin-top: 4px; }
+  .qr-tabs { display: flex; gap: 4px; margin-bottom: 14px; padding: 0 4px; }
+  .qr-tab {
+    background: transparent; color: #888; border: 1px solid transparent;
+    padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    transition: all 0.15s;
+  }
+  .qr-tab:hover { background: rgba(102,126,234,0.08); color: #5568d3; }
+  .qr-tab.active { background: #667eea; color: #fff; font-weight: 500; }
+
   /* ===== Lightbox 灯箱 ===== */
   .lightbox {
     position: fixed; inset: 0; background: rgba(0,0,0,0.85);
@@ -209,8 +287,9 @@
   <div class="tabs">
     <button class="tab active" data-tab="index">① 索引图片</button>
     <button class="tab" data-tab="search">② 以图搜图</button>
-    <button class="tab" data-tab="manage">③ 集合管理</button>
-    <button class="tab" data-tab="demo">④ 运行示例</button>
+    <button class="tab" data-tab="query">③ 字段查询</button>
+    <button class="tab" data-tab="manage">④ 集合管理</button>
+    <button class="tab" data-tab="demo">⑤ 运行示例</button>
   </div>
 
   <!-- ============ 索引图片 ============ -->
@@ -312,6 +391,178 @@
     <h3>相似图片</h3>
     <div id="resultsArea">
       <div class="empty">暂无结果。点击「开始搜索」开始检索。</div>
+    </div>
+  </div>
+
+  <!-- ============ 字段查询 ============ -->
+  <div class="panel" id="tab-query" style="display:none">
+    <h2>字段查询</h2>
+    <p style="color:#666; font-size:13px; margin-bottom:14px">
+      按 <b>id / image_path / created_at</b> 字段查询已索引的图片记录，不走向量相似度。
+      支持「快捷查询」和「条件组合查询」两种模式。
+    </p>
+
+    <!-- 快捷模式 / 高级模式 切换 -->
+    <div class="qr-tabs">
+      <button class="qr-tab active" data-qr-mode="quick">🔎 快捷查询</button>
+      <button class="qr-tab" data-qr-mode="condition">🧩 条件组合</button>
+      <button class="qr-tab" data-qr-mode="raw">⚙️ 高级 expr</button>
+    </div>
+
+    <!-- ===== 快捷查询 ===== -->
+    <div id="qrModeQuick">
+      <div class="query-grid">
+        <!-- 按 id 查 -->
+        <div class="query-card">
+          <h3>🆔 按主键查询</h3>
+          <div class="desc">精确匹配 id，返回单条记录</div>
+          <div class="query-form-row">
+            <label>ID</label>
+            <input type="text" class="query-input mono" id="qByIdInput" placeholder="例如: cat_20260101_120000_000">
+          </div>
+          <div class="query-form-row">
+            <button class="btn" id="qByIdBtn">查询</button>
+            <button class="btn secondary" id="qByIdClearBtn">清空</button>
+          </div>
+        </div>
+
+        <!-- 按路径精确查 -->
+        <div class="query-card">
+          <h3>📁 按图片路径精确查询</h3>
+          <div class="desc">完全匹配 image_path 字段</div>
+          <div class="query-form-row">
+            <label>路径</label>
+            <input type="text" class="query-input mono" id="qByPathInput" placeholder="例如: images/cat.jpg">
+          </div>
+          <div class="query-form-row">
+            <button class="btn" id="qByPathBtn">查询</button>
+            <button class="btn secondary" id="qByPathClearBtn">清空</button>
+          </div>
+        </div>
+
+        <!-- 按路径模糊查 -->
+        <div class="query-card">
+          <h3>🔍 按路径模糊查询 (LIKE %x%)</h3>
+          <div class="desc">image_path 包含关键字（不分大小写取决于 Milvus 配置）</div>
+          <div class="query-form-row">
+            <label>关键字</label>
+            <input type="text" class="query-input mono" id="qByPathLikeInput" placeholder="例如: cat">
+          </div>
+          <div class="query-form-row">
+            <label>Limit</label>
+            <input type="number" class="query-input" id="qByPathLikeLimit" value="100" min="1" max="1000" style="max-width:100px">
+            <button class="btn" id="qByPathLikeBtn">查询</button>
+          </div>
+        </div>
+
+        <!-- 按时间范围查 -->
+        <div class="query-card">
+          <h3>🕒 按入库时间范围</h3>
+          <div class="desc">毫秒时间戳，留空表示不限。提示：可填入 <code>Date.now()</code> 当作「今天」</div>
+          <div class="query-form-row">
+            <label>From</label>
+            <input type="number" class="query-input" id="qTimeFrom" placeholder="起始时间戳 (ms)">
+          </div>
+          <div class="query-form-row">
+            <label>To</label>
+            <input type="number" class="query-input" id="qTimeTo" placeholder="结束时间戳 (ms)">
+          </div>
+          <div class="query-form-row">
+            <label>Limit</label>
+            <input type="number" class="query-input" id="qTimeLimit" value="100" min="1" max="1000" style="max-width:100px">
+            <button class="btn" id="qTimeBtn">查询</button>
+            <button class="btn secondary" id="qTimeTodayBtn">今天</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 条件组合 ===== -->
+    <div id="qrModeCondition" style="display:none">
+      <div class="query-card">
+        <h3>🧩 条件组合查询（AND 串联）</h3>
+        <div class="desc">
+          填一个或多个条件，<b>留空字段不参与过滤</b>。多个条件同时给定时用 AND 串联。
+          服务器最终会回显生成的 Milvus 表达式。
+        </div>
+        <div class="query-form-row">
+          <label>ID =</label>
+          <input type="text" class="query-input mono" id="qcId" placeholder="精确匹配 id（留空跳过）">
+        </div>
+        <div class="query-form-row">
+          <label>image_path =</label>
+          <input type="text" class="query-input mono" id="qcImagePath" placeholder="精确匹配图片路径（留空跳过）">
+        </div>
+        <div class="query-form-row">
+          <label>前缀</label>
+          <input type="text" class="query-input mono" id="qcPathPrefix" placeholder="image_path LIKE 'prefix%'">
+        </div>
+        <div class="query-form-row">
+          <label>包含</label>
+          <input type="text" class="query-input mono" id="qcPathContains" placeholder="image_path LIKE '%x%'">
+        </div>
+        <div class="query-form-row">
+          <label>id IN</label>
+          <input type="text" class="query-input mono" id="qcIdIn" placeholder="逗号分隔: a, b, c">
+        </div>
+        <div class="query-form-row">
+          <label>From ≥</label>
+          <input type="number" class="query-input" id="qcFrom" placeholder="created_at 下界（毫秒）">
+        </div>
+        <div class="query-form-row">
+          <label>To ≤</label>
+          <input type="number" class="query-input" id="qcTo" placeholder="created_at 上界（毫秒）">
+        </div>
+        <div class="query-form-row">
+          <label>Limit</label>
+          <input type="number" class="query-input" id="qcLimit" value="100" min="1" max="1000" style="max-width:100px">
+          <label style="margin-left:16px">
+            <input type="checkbox" id="qcWithVector"> 返回向量（一般不勾）
+          </label>
+        </div>
+        <div class="query-form-row">
+          <button class="btn" id="qcRunBtn">▶ 执行查询</button>
+          <button class="btn secondary" id="qcClearBtn">清空表单</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 高级 expr ===== -->
+    <div id="qrModeRaw" style="display:none">
+      <div class="query-card">
+        <h3>⚙️ 直接传 Milvus 表达式</h3>
+        <div class="desc">
+          <b>注意</b>：本模式不做白名单校验，<code>expr</code> 字符串直接交给 Milvus 执行。
+          适合 QueryCondition 表达不了的复杂查询（OR、子查询、JSON 字段等）。
+        </div>
+        <div class="query-form-row">
+          <label>expr</label>
+          <input type="text" class="query-input mono lg" id="qrExpr"
+                 placeholder='例如: image_path like "images/%" and created_at > 1700000000000'>
+        </div>
+        <div class="query-form-row">
+          <label>Limit</label>
+          <input type="number" class="query-input" id="qrLimit" value="100" min="1" max="1000" style="max-width:100px">
+          <label style="margin-left:16px">
+            <input type="checkbox" id="qrWithVector"> 返回向量（一般不勾）
+          </label>
+        </div>
+        <div class="query-form-row">
+          <button class="btn" id="qrRunBtn">▶ 执行</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 结果区 ===== -->
+    <h3 style="margin-top:18px">查询结果</h3>
+    <div class="query-results-bar">
+      <div class="title">
+        命中 <b id="qrTotal">0</b> 条　·　耗时 <b id="qrDuration">-</b> ms
+      </div>
+      <div class="expr" id="qrExprEcho" title=""></div>
+    </div>
+    <div id="qrResultsArea">
+      <div class="empty">请在上面的表单中填写条件，点击对应按钮执行查询</div>
     </div>
   </div>
 
@@ -674,6 +925,216 @@
       document.getElementById('galleryArea').innerHTML = '<div class="empty">集合已重置</div>';
     } catch (e) { toast('重置失败: ' + e.message, 'error'); }
     finally { setBusy(document.getElementById('resetBtn'), false, '⚠ 重置集合（清空）'); }
+  };
+
+  // ===== 字段查询 =====
+  // 三种模式切换
+  document.querySelectorAll('.qr-tab').forEach(t => {
+    t.addEventListener('click', () => {
+      document.querySelectorAll('.qr-tab').forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+      const mode = t.dataset.qrMode;
+      document.getElementById('qrModeQuick').style.display = mode === 'quick' ? 'block' : 'none';
+      document.getElementById('qrModeCondition').style.display = mode === 'condition' ? 'block' : 'none';
+      document.getElementById('qrModeRaw').style.display = mode === 'raw' ? 'block' : 'none';
+    });
+  });
+
+  // 通用：渲染查询结果到 qrResultsArea
+  function renderQueryResults(data) {
+    const list = data.results || [];
+    document.getElementById('qrTotal').textContent = list.length;
+    document.getElementById('qrDuration').textContent = data.durationMs != null ? data.durationMs : '-';
+    const echoEl = document.getElementById('qrExprEcho');
+    if (data.expr) { echoEl.textContent = 'expr: ' + data.expr; echoEl.title = data.expr; }
+    else { echoEl.textContent = ''; echoEl.title = ''; }
+
+    if (list.length === 0) {
+      document.getElementById('qrResultsArea').innerHTML =
+        '<div class="empty">没有匹配的记录。请调整条件后重试。</div>';
+      return;
+    }
+    const html = '<div class="results-grid">' + list.map(r => {
+      const imgPath = r.imagePath || '';
+      const created = r.createdAt ? new Date(r.createdAt).toLocaleString() : '-';
+      return `
+        <div class="query-result-card" data-img="${escapeHtml(imgPath)}"
+             data-caption="ID: ${escapeHtml(r.id)}　·　时间: ${created}">
+          <img src="${escapeHtml(imgPath)}" onerror="this.style.background='#fee';this.alt='加载失败'" alt="">
+          <div class="qrc-body">
+            <div class="qrc-id">ID: ${escapeHtml(r.id)}</div>
+            <div class="qrc-path">${escapeHtml(imgPath)}</div>
+            <div class="qrc-time">⏱ ${created}</div>
+          </div>
+        </div>
+      `;
+    }).join('') + '</div>';
+    const area = document.getElementById('qrResultsArea');
+    area.innerHTML = html;
+    area.querySelectorAll('.query-result-card').forEach(card => {
+      card.addEventListener('click', () => openLightbox(card.dataset.img, card.dataset.caption));
+    });
+  }
+
+  // 通用：用 POST /api/image-search/query
+  async function runConditionQuery(payload) {
+    document.getElementById('qrResultsArea').innerHTML = '<div class="empty">查询中…</div>';
+    const t0 = performance.now();
+    try {
+      const res = await fetch(API + '/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok || data.success === false) throw new Error(data.error || `查询失败（HTTP ${res.status}）`);
+      const durationMs = Math.round(performance.now() - t0);
+      renderQueryResults(Object.assign({}, data, { durationMs }));
+      toast(`查询完成：${data.results ? data.results.length : 0} 条`, 'success');
+    } catch (e) {
+      document.getElementById('qrResultsArea').innerHTML =
+        `<div class="empty">❌ ${escapeHtml(e.message)}</div>`;
+      toast('查询失败: ' + e.message, 'error');
+    }
+  }
+
+  // 通用：用 POST /api/image-search/query/raw
+  async function runRawExprQuery(expr, withVector, limit) {
+    document.getElementById('qrResultsArea').innerHTML = '<div class="empty">查询中…</div>';
+    const t0 = performance.now();
+    try {
+      const res = await fetch(API + '/query/raw', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expr, withVector, limit })
+      });
+      const data = await res.json();
+      if (!res.ok || data.success === false) throw new Error(data.error || `查询失败（HTTP ${res.status}）`);
+      const durationMs = Math.round(performance.now() - t0);
+      renderQueryResults(Object.assign({}, data, { durationMs }));
+      toast(`查询完成：${data.results ? data.results.length : 0} 条`, 'success');
+    } catch (e) {
+      document.getElementById('qrResultsArea').innerHTML =
+        `<div class="empty">❌ ${escapeHtml(e.message)}</div>`;
+      toast('查询失败: ' + e.message, 'error');
+    }
+  }
+
+  // ---- 快捷模式 ----
+
+  // 1) 按 id 查
+  document.getElementById('qByIdBtn').onclick = async () => {
+    const id = document.getElementById('qByIdInput').value.trim();
+    if (!id) { toast('请输入 id', 'error'); return; }
+    document.getElementById('qrResultsArea').innerHTML = '<div class="empty">查询中…</div>';
+    const t0 = performance.now();
+    try {
+      const data = await fetch(`${API}/query/id/${encodeURIComponent(id)}`).then(r => r.json());
+      if (!data.success) throw new Error(data.error || '查询失败');
+      const list = data.result ? [data.result] : [];
+      const durationMs = Math.round(performance.now() - t0);
+      renderQueryResults({ expr: `id == "${id}"`, results: list, durationMs });
+      if (list.length === 0) toast('没有匹配的记录', 'warn');
+      else toast(`命中 1 条`, 'success');
+    } catch (e) {
+      document.getElementById('qrResultsArea').innerHTML =
+        `<div class="empty">❌ ${escapeHtml(e.message)}</div>`;
+      toast('查询失败: ' + e.message, 'error');
+    }
+  };
+  document.getElementById('qByIdClearBtn').onclick = () => {
+    document.getElementById('qByIdInput').value = '';
+  };
+
+  // 2) 按路径精确查
+  document.getElementById('qByPathBtn').onclick = async () => {
+    const path = document.getElementById('qByPathInput').value.trim();
+    if (!path) { toast('请输入路径', 'error'); return; }
+    document.getElementById('qrResultsArea').innerHTML = '<div class="empty">查询中…</div>';
+    const t0 = performance.now();
+    try {
+      const data = await fetch(`${API}/query/path?path=${encodeURIComponent(path)}`).then(r => r.json());
+      if (!data.success) throw new Error(data.error || '查询失败');
+      const durationMs = Math.round(performance.now() - t0);
+      renderQueryResults({ expr: `image_path == "${path}"`, results: data.results || [], durationMs });
+      toast(`命中 ${(data.results || []).length} 条`, 'success');
+    } catch (e) {
+      document.getElementById('qrResultsArea').innerHTML =
+        `<div class="empty">❌ ${escapeHtml(e.message)}</div>`;
+      toast('查询失败: ' + e.message, 'error');
+    }
+  };
+  document.getElementById('qByPathClearBtn').onclick = () => {
+    document.getElementById('qByPathInput').value = '';
+  };
+
+  // 3) 按路径模糊查
+  document.getElementById('qByPathLikeBtn').onclick = () => {
+    const keyword = document.getElementById('qByPathLikeInput').value.trim();
+    if (!keyword) { toast('请输入关键字', 'error'); return; }
+    const limit = parseInt(document.getElementById('qByPathLikeLimit').value) || 100;
+    runConditionQuery({ pathContains: keyword, limit });
+  };
+
+  // 4) 按时间范围查
+  document.getElementById('qTimeBtn').onclick = () => {
+    const fromStr = document.getElementById('qTimeFrom').value.trim();
+    const toStr = document.getElementById('qTimeTo').value.trim();
+    const limit = parseInt(document.getElementById('qTimeLimit').value) || 100;
+    const payload = { limit };
+    if (fromStr) payload.from = parseInt(fromStr);
+    if (toStr) payload.to = parseInt(toStr);
+    if (!fromStr && !toStr) { toast('请至少填写 From 或 To', 'error'); return; }
+    runConditionQuery(payload);
+  };
+  document.getElementById('qTimeTodayBtn').onclick = () => {
+    const now = Date.now();
+    const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+    document.getElementById('qTimeFrom').value = startOfDay.getTime();
+    document.getElementById('qTimeTo').value = now;
+    document.getElementById('qTimeLimit').value = 500;
+  };
+
+  // ---- 条件组合 ----
+  document.getElementById('qcRunBtn').onclick = () => {
+    const payload = {};
+    const id = document.getElementById('qcId').value.trim();
+    if (id) payload.id = id;
+    const imagePath = document.getElementById('qcImagePath').value.trim();
+    if (imagePath) payload.imagePath = imagePath;
+    const prefix = document.getElementById('qcPathPrefix').value.trim();
+    if (prefix) payload.pathPrefix = prefix;
+    const contains = document.getElementById('qcPathContains').value.trim();
+    if (contains) payload.pathContains = contains;
+    const idInStr = document.getElementById('qcIdIn').value.trim();
+    if (idInStr) {
+      payload.idIn = idInStr.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    const from = document.getElementById('qcFrom').value.trim();
+    if (from) payload.from = parseInt(from);
+    const to = document.getElementById('qcTo').value.trim();
+    if (to) payload.to = parseInt(to);
+    payload.withVector = document.getElementById('qcWithVector').checked;
+    payload.limit = parseInt(document.getElementById('qcLimit').value) || 100;
+    if (Object.keys(payload).filter(k => k !== 'withVector' && k !== 'limit').length === 0) {
+      toast('请至少填写一个查询条件', 'error'); return;
+    }
+    runConditionQuery(payload);
+  };
+  document.getElementById('qcClearBtn').onclick = () => {
+    ['qcId','qcImagePath','qcPathPrefix','qcPathContains','qcIdIn','qcFrom','qcTo']
+      .forEach(id => document.getElementById(id).value = '');
+    document.getElementById('qcWithVector').checked = false;
+    document.getElementById('qcLimit').value = 100;
+  };
+
+  // ---- 高级 expr ----
+  document.getElementById('qrRunBtn').onclick = () => {
+    const expr = document.getElementById('qrExpr').value.trim();
+    if (!expr) { toast('请输入 expr', 'error'); return; }
+    const withVector = document.getElementById('qrWithVector').checked;
+    const limit = parseInt(document.getElementById('qrLimit').value) || 100;
+    runRawExprQuery(expr, withVector, limit);
   };
 
   // ===== 运行示例 =====

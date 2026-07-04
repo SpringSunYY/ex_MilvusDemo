@@ -32,7 +32,7 @@ milvus:
 # ==============================================================
 embedding:
   # 当前激活的模型
-  model: siglip
+  model: clip
   # 推理设备：cpu / cuda
   device: cpu
   # 批量推理 batch size
@@ -50,7 +50,7 @@ embedding:
   # 控制三个 extractor 内部的性能摘要日志（单图耗时/多尺度并发等待/批量性能摘要/DINO 五段诊断）
   # 异常日志（模型加载失败/推理失败）不受此开关影响，异常始终打印
   # ============================================================
-  perf-log-enabled: true
+  perf-log-enabled: false
   # CLIP 模型配置
   clip:
     # 模型路径（相对于 classpath / 工作目录）
