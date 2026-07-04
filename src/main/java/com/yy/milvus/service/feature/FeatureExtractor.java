@@ -127,4 +127,16 @@ public interface FeatureExtractor {
     default int[] getSessionPoolSnapshot() {
         return new int[] { 0, 0, 0 };
     }
+
+    /**
+     * 打印并清零本次会话的特征提取性能统计。
+     * 由调用方（如 MilvusService）在一批完成后调用，避免与进程级计数混淆。
+     * <p>
+     * 受 {@code embedding.perf-log-enabled} 控制；关闭时直接跳过，perf 内部依然累计耗时。
+     * <p>
+     * 异常日志（log.error / log.warn 推理失败）不在此控制范围内，异常始终打印。
+     */
+    default void logAndResetPerf(String tag) {
+        // no-op: 简单实现不打印性能摘要
+    }
 }

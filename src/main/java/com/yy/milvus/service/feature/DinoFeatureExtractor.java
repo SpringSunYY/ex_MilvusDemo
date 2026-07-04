@@ -87,11 +87,6 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     private final ThreadLocal<int[]> pixelBuffer =
             ThreadLocal.withInitial(() -> new int[448 * 448]);
 
-    // ============ 诊断用采样计数器（临时：批量入库定位瓶颈，跑完后可删除）============
-    private final AtomicInteger diagSample = new java.util.concurrent.atomic.AtomicInteger(0);
-    // [诊断] 采样：每 10 张采 1 张 + 最后 1 张。这样 32 张跑出 4 张详细分解。
-    private static final int DIAG_EVERY = 10;
-
     private static final Deque<OrtSession> POOL = new ArrayDeque<>();
     private static volatile boolean initialized = false;
     private static final AtomicInteger INSTANCE_COUNT = new AtomicInteger(0);
@@ -105,6 +100,11 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     private OrtEnvironment env;
     private Path modelPath;
     private int[] scales;
+
+    /**
+     * 性能摘要统计（共享 PerfRecorder，不在 extractor 内重复实现）
+     */
+    private PerfRecorder perf;
 
     @PostConstruct
     public void init() throws Exception {
@@ -145,6 +145,9 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                 POOL.peekFirst().getOutputNames());
 
         int poolBeforeProbe = POOL.size();
+        // 性能摘要开关先初始化（启动期预热也算"性能摘要"）
+        this.perf = new PerfRecorder(log, "DINO", embeddingProps.isPerfLogEnabled());
+        log.info("[DINO 启动] perfLogEnabled={}", embeddingProps.isPerfLogEnabled());
         log.info("[DINO 预热] 池预热 ...");
         int warmupErrors = 0;
         int warmupSize = scales[0]; // 用实际配置的最小尺度预热，不要用 518
@@ -154,7 +157,10 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                 long w0 = System.currentTimeMillis();
                 // 使用 FloatBuffer 减少 GC 压力
                 float[] dummy = new float[3 * warmupSize * warmupSize];
-                FeatureExtractorUtils.fillDummyCenter(dummy, warmupSize, MEAN, STD);
+                int plane = warmupSize * warmupSize;
+                Arrays.fill(dummy, 0, plane, (0.5f - MEAN[0]) / STD[0]);
+                Arrays.fill(dummy, plane, plane * 2, (0.5f - MEAN[1]) / STD[1]);
+                Arrays.fill(dummy, plane * 2, plane * 3, (0.5f - MEAN[2]) / STD[2]);
                 try (OnnxTensor tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(dummy), new long[]{1, 3, warmupSize, warmupSize})) {
                     Map<String, OnnxTensor> inputs = Collections.singletonMap("pixel_values", tensor);
                     try (OrtSession.Result result = s.run(inputs)) {
@@ -162,7 +168,9 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                     }
                 }
                 long wMs = System.currentTimeMillis() - w0;
-                log.info("[DINO 预热]   warmup={}ms (scale={})", wMs, warmupSize);
+                if (perf.isEnabled()) {
+                    log.info("[DINO 预热]   warmup={}ms (scale={})", wMs, warmupSize);
+                }
             } catch (Exception e) {
                 warmupErrors++;
                 log.warn("[DINO 预热]   warmup failed: {}", e.getMessage());
@@ -172,7 +180,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         }
         if (warmupErrors > 0) {
             log.warn("[DINO 预热] 池预热完成，{}/{} 个失败", warmupErrors, poolSize);
-        } else {
+        } else if (perf.isEnabled()) {
             log.info("[DINO 预热] 池预热完成");
         }
         probeHeads(POOL.peekFirst(), warmupSize);
@@ -190,7 +198,16 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     }
 
     private static int[] parseScales(List<Integer> list) {
-        return FeatureExtractorUtils.parseScales(list, DEFAULT_SHORT_EDGE, "DINO", 32);
+        if (list == null || list.isEmpty()) {
+            return new int[]{DEFAULT_SHORT_EDGE};
+        }
+        int[] result = new int[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            int v = list.get(i);
+            if (v < 32) throw new IllegalArgumentException("[DINO] scales 最小值为 32，当前: " + v);
+            result[i] = v;
+        }
+        return result;
     }
 
     private OrtSession borrowSession() throws OrtException {
@@ -263,26 +280,37 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     }
 
     private Path resolveModelPath(String configPath, String tower) {
-        Path p = FeatureExtractorUtils.resolveModelPath(configPath, tower, "DINO", getClass());
-        // 走公共解析后，按原行为打日志（"绝对路径 / classpath / 工作目录" 三种来源分别提示）
-        Path original = Paths.get(configPath);
-        if (original.isAbsolute() && Files.exists(original)) {
-            log.info("[DINO] {}模型使用绝对路径: {}", tower, p);
-        } else {
-            try {
-                String normalized = configPath.replace('\\', '/');
-                var url = getClass().getClassLoader().getResource(normalized);
-                if (url != null && p.equals(Paths.get(url.toURI()))) {
-                    log.info("[DINO] {}模型使用 classpath: {}", tower, p);
-                    return p;
-                }
-            } catch (Exception ignored) {
-            }
-            if (!original.isAbsolute()) {
-                log.warn("[DINO] {}模型使用工作目录相对路径: {}", tower, p);
-            }
+        if (configPath == null || configPath.isEmpty()) {
+            throw new IllegalArgumentException("[DINO] 模型路径未配置");
         }
-        return p;
+        Path p = Paths.get(configPath);
+
+        // 1) 绝对路径
+        if (p.isAbsolute() && Files.exists(p)) {
+            log.info("[DINO] {}模型使用绝对路径: {}", tower, p);
+            return p;
+        }
+
+        // 2) classpath
+        try {
+            String normalized = configPath.replace('\\', '/');
+            var url = getClass().getClassLoader().getResource(normalized);
+            if (url != null) {
+                Path cp = Paths.get(url.toURI());
+                log.info("[DINO] {}模型使用 classpath: {}", tower, cp);
+                return cp;
+            }
+        } catch (Exception ignored) {
+        }
+
+        // 3) 工作目录相对路径
+        if (Files.exists(p)) {
+            log.warn("[DINO] {}模型使用工作目录相对路径: {}", tower, p.toAbsolutePath());
+            return p.toAbsolutePath();
+        }
+
+        // 4) 找不到
+        return p.isAbsolute() ? p : p.toAbsolutePath();
     }
 
     @PreDestroy
@@ -374,10 +402,9 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         boolean wantHflip = embeddingProps.getDino().isHflipEnabled();
         int total = scales.length * (wantHflip ? 2 : 1);
 
-        // [诊断] 采样：每 DIAG_EVERY 张抽 1 张打五段分解。diag[0..4]: resize, prep, run, borrowWait, failCount
-        int sampleCount = diagSample.incrementAndGet();
-        boolean doDiag = (sampleCount % DIAG_EVERY == 0);
-        long[] diag = doDiag ? new long[5] : null;
+        // [诊断] 采样：每 DIAG_EVERY 张抽 1 张打五段分解。diag 索引见 PerfRecorder.DIAG_SLOTS 注释
+        long[] diag = perf.tryStartDiag();
+        int sampleCount = 0; // 仅在 diag != null 时使用，记录本次采样编号（用 diagSample 当前计数 + 上限）
 
         try {
             float[] embOriginal;
@@ -508,23 +535,18 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                 branch = "parallel";
             }
             long totalMs = System.currentTimeMillis() - t0;
-            log.info("[DINO 单图] scales={} | hflip={} | branch={} | dim={} | 耗时 {}ms",
-                    Arrays.toString(scales), wantHflip, branch,
-                    result.length, totalMs);
+            // 性能摘要：单图耗时，受 perf-log-enabled 控制
+            if (perf.isEnabled()) {
+                log.info("[DINO 单图] scales={} | hflip={} | branch={} | dim={} | 耗时 {}ms",
+                        Arrays.toString(scales), wantHflip, branch,
+                        result.length, totalMs);
+            }
 
             // [诊断] 采样图打印五段分解：toRgb + (resize+crop) + prep(NCHW) + run(session.run) + borrowWait
+            // 同样是性能摘要，受 perf-log-enabled 控制
             if (diag != null) {
-                long sumInner = diag[0] + diag[1] + diag[2] + diag[3];
-                long other = totalMs - sumInner - (toRgbNs / 1_000_000L);
-                log.info("[DINO 五段] sample={} | toRgb={}ms | resize+crop={}ms | prep={}ms | run={}ms | borrowWait={}ms | 失败 {} 尺度 | unaccounted={}ms",
-                        sampleCount,
-                        toRgbNs / 1_000_000L,
-                        diag[0],   // resize+crop 累加
-                        diag[1],   // prep 累加
-                        diag[2],   // run 累加
-                        diag[3],   // borrowWait 累加
-                        diag[4],   // fail count
-                        other);
+                perf.logDiag(sampleCount == 0 ? 0 : sampleCount,
+                        totalMs, toRgbNs / 1_000_000L, diag);
             }
             return result;
 
@@ -570,17 +592,13 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     }
 
     /**
-     * @param diag 如果非 null，调用方会在结束时拿到本次多尺度累计的细分耗时（5 段累加，毫秒）：
-     *             [0] resize+crop累加 [1] prep(NCHW填充)累加 [2] run(session.run)累加
-     *             [3] borrowWait累加 [4] failCount
+     * @param diag 如果非 null，调用方在结束时拿到本次多尺度累计的细分耗时（5 段累加，毫秒）。
+     *             槽位对齐 {@link PerfRecorder} 常量：diag[RESIZE_CROP] / [PREP] / [RUN] / [BORROW_WAIT] / [FAIL_COUNT]。
+     *             [TO_RGB] 不由本方法填（由调用方直接测）。
      */
     private float[] runMultiScaleSerial(BufferedImage rgb, long[] diag) throws IOException {
         if (diag != null) {
-            diag[0] = 0;
-            diag[1] = 0;
-            diag[2] = 0;
-            diag[3] = 0;
-            diag[4] = 0;
+            Arrays.fill(diag, 0, PerfRecorder.DIAG_SLOTS, 0L);
         }
         int avgLen = -1;
         float[] avg = null;
@@ -607,14 +625,14 @@ public class DinoFeatureExtractor implements FeatureExtractor {
 
             try {
                 // runInference 内部累加到 infDiag[0..2]: [0]=prep [1]=run [2]=borrowWait
-                // 写到一个独立的临时数组，避免和 diag[0]=resize+crop 的语义冲突
+                // 写到一个独立的临时数组，避免和 diag[RESIZE_CROP] 的语义冲突
                 long[] infDiag = diag != null ? new long[3] : null;
                 float[] emb = runInference(tensorInput, targetShort, infDiag);
                 if (diag != null) {
-                    diag[0] += resizeNs / 1_000_000L;                       // resize+crop
-                    diag[1] += infDiag[0];                                  // prep (NCHW fill)
-                    diag[2] += infDiag[1];                                  // run (session.run)
-                    diag[3] += infDiag[2];                                  // borrowWait
+                    diag[PerfRecorder.RESIZE_CROP] += resizeNs / 1_000_000L;
+                    diag[PerfRecorder.PREP] += infDiag[0];
+                    diag[PerfRecorder.RUN] += infDiag[1];
+                    diag[PerfRecorder.BORROW_WAIT] += infDiag[2];
                 }
                 log.debug("[DINO 尺度] scale={} | 推理耗时 {}ms | 当前 {}/{} 个尺度有效",
                         targetShort,
@@ -632,7 +650,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                 float scale = 1.0f / scales.length;
                 for (int i = 0; i < avgLen; i++) avg[i] += emb[i] * scale;
             } catch (Exception e) {
-                if (diag != null) diag[4]++;
+                if (diag != null) diag[PerfRecorder.FAIL_COUNT]++;
                 log.warn("[DINO 多尺度] 尺度 {} 推理失败: {}", targetShort, e.getMessage());
             }
         }
@@ -767,7 +785,7 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                 inputs.put("pixel_values", tensor);
                 try (OrtSession.Result result = session.run(inputs)) {
                     long runNs = System.nanoTime() - t0;
-                    recordPerf(prepNs, runNs);
+                    perf.record(prepNs, runNs);
                     if (diag != null) {
                         diag[0] += prepNs / 1_000_000L;
                         diag[1] += runNs / 1_000_000L;
@@ -780,19 +798,8 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         }
     }
 
-    // ============ 性能统计（线程安全：单次写者 - 性能侧读）============
-    // 用 LongAdder 替代 AtomicLong：高并发累加场景下 LongAdder 通过分散 Cell 降低 CAS 争用，
-    // 16 线程批量入库时 perf 调用频率高，LongAdder 比 AtomicLong 快 3-5 倍。
-    private final LongAdder perfPrepNs = new LongAdder();
-    private final LongAdder perfRunNs = new LongAdder();
-    private final LongAdder perfCalls = new LongAdder();
+    // 性能统计：线程安全的 prepNs/runNs/calls 累加 + 启动期一次性创建，由 PerfRecorder 统一承载
     private final AtomicInteger peakBorrowed = new AtomicInteger(0);
-
-    private void recordPerf(long prepNs, long runNs) {
-        perfPrepNs.add(prepNs);
-        perfRunNs.add(runNs);
-        perfCalls.increment();
-    }
 
     private float[] runSingleScaleFallback(BufferedImage image) throws IOException {
         int targetShort = scales.length > 0 ? scales[0] : DEFAULT_SHORT_EDGE;
@@ -897,7 +904,15 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     }
 
     private static BufferedImage toRgb(BufferedImage img) {
-        return FeatureExtractorUtils.toRgb(img);
+        if (img.getType() == BufferedImage.TYPE_INT_RGB) return img;
+        BufferedImage out = new BufferedImage(img.getWidth(), img.getHeight(), BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = out.createGraphics();
+        try {
+            g.drawImage(img, 0, 0, null);
+        } finally {
+            g.dispose();
+        }
+        return out;
     }
 
     private BufferedImage centerCrop(BufferedImage src, int targetW, int targetH) {
@@ -909,16 +924,34 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         int cw = Math.min(targetW, w);
         int ch = Math.min(targetH, h);
 
-        // 如果 src 任意一边 < target，getSubimage 出来的子图不是 targetW × targetH，
-        // 后续 toNchwFloat 读取时会越界。这里走 pad 黑边兜底，输出严格 targetW × targetH。
-        if (cw < targetW || ch < targetH) {
-            return ImagePreprocessor.padToSize(src, Math.max(targetW, targetH));
+        // 物理复制：不用 getSubimage，避免子图视图 + Raster.getPixels 的 stride 不一致。
+        // 极小图（任意一边 < target）走 pad 黑边兜底，输出严格 targetW × targetH。
+        BufferedImage out = new BufferedImage(targetW, targetH, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = out.createGraphics();
+        try {
+            g.setColor(Color.BLACK);
+            g.fillRect(0, 0, targetW, targetH);
+            g.drawImage(src, 0, 0, targetW, targetH, x, y, x + cw, y + ch, null);
+        } finally {
+            g.dispose();
         }
-        return src.getSubimage(x, y, cw, ch);
+        return out;
     }
 
+    /**
+     * 水平翻转：与 CLIP / SigLIP 等价实现一致。
+     */
     private static BufferedImage flipHorizontal(BufferedImage src) {
-        return ImagePreprocessor.flipHorizontal(src);
+        int w = src.getWidth();
+        int h = src.getHeight();
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = out.createGraphics();
+        try {
+            g.drawImage(src, w, 0, -w, h, null);
+        } finally {
+            g.dispose();
+        }
+        return out;
     }
 
     /**
@@ -997,7 +1030,10 @@ public class DinoFeatureExtractor implements FeatureExtractor {
             log.info("[DINO 头探测] 启动期探测所有输出头 ...");
             // 使用 FloatBuffer 减少 GC 压力
             float[] dummy = new float[3 * size * size];
-            FeatureExtractorUtils.fillDummyCenter(dummy, size, MEAN, STD);
+            int plane = size * size;
+            Arrays.fill(dummy, 0, plane, (0.5f - MEAN[0]) / STD[0]);
+            Arrays.fill(dummy, plane, plane * 2, (0.5f - MEAN[1]) / STD[1]);
+            Arrays.fill(dummy, plane * 2, plane * 3, (0.5f - MEAN[2]) / STD[2]);
             try (OnnxTensor tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(dummy), new long[]{1, 3, size, size})) {
                 Map<String, OnnxTensor> inputs = Collections.singletonMap("pixel_values", tensor);
                 try (OrtSession.Result result = session.run(inputs)) {
@@ -1007,8 +1043,8 @@ public class DinoFeatureExtractor implements FeatureExtractor {
                         if (!(ov instanceof OnnxTensor ot)) continue;
                         long[] shape = ot.getInfo().getShape();
                         Object onnxVal = ot.getValue();
-                        int dim = FeatureExtractorUtils.inferDimFromOnnxValue(onnxVal);
-                        String type = FeatureExtractorUtils.onnxValueTypeName(onnxVal);
+                        int dim = inferDimFromOnnxValue(onnxVal);
+                        String type = onnxValueTypeName(onnxVal);
                         log.info("[DINO 头探测]   {}  shape={}  type={}  dim={}", e.getKey(), Arrays.toString(shape), type, dim);
                         if (dim > maxDim) maxDim = dim;
                     }
@@ -1037,8 +1073,55 @@ public class DinoFeatureExtractor implements FeatureExtractor {
         }
     }
 
+    /**
+     * L2 归一化（原地）。用 double 累加 + 一次 sqrt 避免 float 累加误差。
+     */
     private static float[] l2Normalize(float[] v) {
-        return FeatureExtractorUtils.l2Normalize(v);
+        double sum = 0;
+        for (float f : v) sum += (double) f * f;
+        double norm = Math.sqrt(sum);
+        if (norm == 0) return v;
+        float inv = (float) (1.0 / norm);
+        for (int i = 0; i < v.length; i++) v[i] *= inv;
+        return v;
+    }
+
+    /**
+     * 从 ONNX value 的 Java 容器对象推断有效特征维度。
+     */
+    private static int inferDimFromOnnxValue(Object onnxVal) {
+        if (onnxVal instanceof float[][][] a3) {
+            return (a3.length > 0 && a3[0].length > 0) ? a3[0][0].length : -1;
+        }
+        if (onnxVal instanceof float[][] a) {
+            return a.length > 0 ? a[0].length : -1;
+        }
+        if (onnxVal instanceof float[] fa) {
+            return fa.length;
+        }
+        if (onnxVal instanceof List<?> l && !l.isEmpty()) {
+            Object row = l.get(0);
+            if (row instanceof float[] fr) return fr.length;
+            if (row instanceof Number) return l.size();
+            if (row instanceof List<?> inner) return inner.size();
+            return -1;
+        }
+        if (onnxVal instanceof Object[] a && a.length > 0 && a[0] instanceof float[] fr) {
+            return fr.length;
+        }
+        return -1;
+    }
+
+    /**
+     * 配套 inferDimFromOnnxValue：返回 Java 容器类型名。
+     */
+    private static String onnxValueTypeName(Object onnxVal) {
+        if (onnxVal instanceof float[][][]) return "float[][][]";
+        if (onnxVal instanceof float[][]) return "float[][]";
+        if (onnxVal instanceof float[]) return "float[]";
+        if (onnxVal instanceof List<?>) return "List";
+        if (onnxVal instanceof Object[]) return "Object[]";
+        return "?";
     }
 
     @Override
@@ -1065,19 +1148,10 @@ public class DinoFeatureExtractor implements FeatureExtractor {
     /**
      * 打印并清零本次会话的特征提取性能统计。
      * 由调用方（如 MilvusService）在一批完成后调用，避免与进程级计数混淆。
+     * <p>
+     * 受 {@code embedding.perf-log-enabled} 控制；关闭时直接跳过，perf 内部依然累计耗时。
      */
     public void logAndResetPerf(String tag) {
-        int calls = (int) perfCalls.sumThenReset();
-        if (calls == 0) {
-            log.info("[DINO 性能][{}] 本批无推理调用", tag);
-            return;
-        }
-        long prepMs = perfPrepNs.sumThenReset() / 1_000_000L;
-        long runMs = perfRunNs.sumThenReset() / 1_000_000L;
-        log.info("[DINO 性能][{}] 调用 {} 次 | 预处理 {}ms ({}ms/次) | run() {}ms ({}ms/次) | 占比 prep:run = {}:{}",
-                tag, calls,
-                prepMs, prepMs / calls,
-                runMs, runMs / calls,
-                prepMs, runMs);
+        perf.logAndReset(tag);
     }
 }

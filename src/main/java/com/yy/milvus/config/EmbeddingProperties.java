@@ -64,6 +64,20 @@ public class EmbeddingProperties {
      */
     private boolean batchMode = true;
 
+    /**
+     * 性能日志开关（默认开启）。
+     * <p>
+     * 控制各 extractor 内部的"性能摘要"日志：
+     * - 单图推理耗时
+     * - 多尺度并发等待耗时
+     * - 批量入库完成后的 prep/run 性能摘要（logAndResetPerf / maybeLogStats）
+     * - DINO 五段诊断采样
+     * <p>
+     * 异常日志（log.error / log.warn 推理失败 / 模型加载失败）<b>不受此开关控制</b>，
+     * 异常必须始终打印。
+     */
+    private boolean perfLogEnabled = true;
+
     @Data
     public static class ClipProperties {
         /**
