@@ -186,7 +186,7 @@ public class ImageIndexService {
     }
 
     /**
-     * 上传并批量索引（MultipartFile[]）。
+     * 上传并批量索引（MultipartFile[]）：优先复用 uploads 同名文件，未命中才落盘。
      */
     public IndexResult indexBatch(MultipartFile[] files) throws Exception {
         List<String> paths = new ArrayList<>();
@@ -194,7 +194,7 @@ public class ImageIndexService {
 
         for (MultipartFile file : files) {
             try {
-                paths.add(fileStorage.save(file));
+                paths.add(fileStorage.saveOrReuse(file));
             } catch (IOException e) {
                 log.warn("[批量索引] 文件保存失败: {}", file.getOriginalFilename(), e);
                 skipped++;
@@ -225,32 +225,28 @@ public class ImageIndexService {
         }
         int batchSizeEff = batchSize <= 0 ? milvusProps.getInsertBatchSize() : batchSize;
 
-        File uploadDir = new File(UPLOAD_DIR);
-        if (!uploadDir.exists()) uploadDir.mkdirs();
-
         // 1) 扫描图片
         List<File> imageFiles = new ArrayList<>();
         collectImages(root, imageFiles, recursive);
         log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         log.info("[导入开始] 目录: {} | 递归: {} | 共 {} 张图片", dir, recursive, imageFiles.size());
 
-        // 2) 复制 + 文件层去重（目标位置已存在则跳过）
+        // 2) 文件层去重：复用已有同名文件，未命中才复制；都入库
         List<String> toIndex = new ArrayList<>();
         int skipped = 0;
         int failed = 0;
+        File uploadDir = new File(UPLOAD_DIR);
         for (File f : imageFiles) {
             try {
-                File destFile = resolveUniqueFile(uploadDir, f.getName());
-                if (destFile.length() == 0) {
-                    // resolveUniqueFile 找到的 destFile 不存在 → 需要复制
-                    Files.copy(f.toPath(), destFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                } else {
-                    // 文件已存在 → 跳过（文件层去重）
+                File destFile = new File(uploadDir, f.getName());
+                if (destFile.exists() && destFile.length() > 0) {
                     skipped++;
-                    log.info("[导入跳过] 已存在同名文件: {}", destFile.getName());
-                    continue;
+                    log.info("[导入跳过复制] 复用已有文件: {}", f.getName());
+                } else {
+                    Files.copy(f.toPath(), destFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    log.info("[导入复制] {} -> {}", f.getName(), f.getName());
                 }
-                toIndex.add(UPLOAD_DIR + "/" + destFile.getName());
+                toIndex.add(UPLOAD_DIR + "/" + f.getName());
             } catch (IOException e) {
                 failed++;
                 log.warn("[导入] 文件复制失败: {}", f.getAbsolutePath(), e);
@@ -345,26 +341,6 @@ public class ImageIndexService {
                 }
             }
         }
-    }
-
-    /** 同名文件加 _1、_2 后缀 */
-    private File resolveUniqueFile(File dir, String name) {
-        String base, ext;
-        int dot = name.lastIndexOf('.');
-        if (dot > 0) {
-            base = name.substring(0, dot);
-            ext = name.substring(dot);
-        } else {
-            base = name;
-            ext = "";
-        }
-        File f = new File(dir, name);
-        int counter = 1;
-        while (f.exists() && f.length() > 0) {
-            f = new File(dir, base + "_" + counter + ext);
-            counter++;
-        }
-        return f;
     }
 
     /** 懒初始化特征提取线程池 */

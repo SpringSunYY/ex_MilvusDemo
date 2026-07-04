@@ -61,10 +61,21 @@ public class FileStorageService {
     }
 
     /**
-     * 保存上传文件，自动生成唯一文件名（保留原扩展名）
+     * 保存上传文件，<b>复用</b> uploads 目录下同名已有文件；
+     * 同名文件不存在时按<b>原始文件名（含扩展名）</b>落盘。
      */
     public String save(MultipartFile file) throws IOException {
-        return save(file, null);
+        validateImage(file);
+        String originalName = file.getOriginalFilename();
+        String savedName = sanitizeFileName(originalName);
+        File destFile = resolveUniqueFile(new File(UPLOAD_DIR), savedName);
+        if (destFile.exists() && destFile.length() > 0) {
+            log.info("[文件存储] 复用已有文件: {} -> {}", originalName, destFile.getName());
+            return UPLOAD_DIR + destFile.getName();
+        }
+        Files.copy(file.getInputStream(), destFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        log.info("[文件存储] 保存成功: {} -> {}", originalName, destFile.getName());
+        return UPLOAD_DIR + destFile.getName();
     }
 
     /**
@@ -197,15 +208,9 @@ public class FileStorageService {
     }
 
     private File resolveUniqueFile(File dir, String baseName) {
-        int dot = baseName.lastIndexOf('.');
-        String name = dot > 0 ? baseName.substring(0, dot) : baseName;
-        String ext = dot > 0 ? baseName.substring(dot) : "";
-
         File f = new File(dir, baseName);
-        int counter = 1;
-        while (f.exists() && f.length() > 0) {
-            f = new File(dir, name + "_" + counter + ext);
-            counter++;
+        if (f.exists() && f.length() > 0) {
+            return f;
         }
         return f;
     }
